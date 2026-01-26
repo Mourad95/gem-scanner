@@ -7,8 +7,15 @@
   "scripts": {
     "build": "tsc",
     "start": "tsx src/index.ts",
-    "dev": "tsx watch src/index.ts",
-    "type-check": "tsc --noEmit"
+    "dev": "nodemon --exec tsx src/index.ts",
+    "type-check": "tsc --noEmit",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "test:ui": "vitest --ui",
+    "test:telegram": "tsx src/test-telegram.ts",
+    "test:pumpportal": "tsx src/test-pumpportal.ts",
+    "get-chat-id": "tsx src/get-chat-id.ts",
+    "debug:telegram": "tsx src/debug-telegram.ts"
   },
   "keywords": [
     "solana",
@@ -22,6 +29,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@solana/web3.js": "^1.98.4",
     "axios": "^1.13.3",
     "chalk": "^5.6.2",
     "dotenv": "^16.6.1",
@@ -31,7 +39,10 @@
     "@types/axios": "^0.9.36",
     "@types/node": "^22.19.7",
     "@types/ws": "^8.18.1",
+    "@vitest/ui": "^4.0.18",
+    "nodemon": "^3.1.9",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }

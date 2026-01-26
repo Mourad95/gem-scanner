@@ -147,7 +147,8 @@ export class TelegramNotifier {
     // Bonding Curve avec barre de progression
     const bondingCurveFormatted = bondingCurveProgress.toFixed(2);
     message += `📈 *Bonding Curve:* ${this.escapeMarkdown(bondingCurveFormatted)}%\n`;
-    message += `└─ ${this.formatBondingCurveBar(bondingCurveProgress)}\n\n`;
+    const bar = this.formatBondingCurveBar(bondingCurveProgress);
+    message += `└─ ${this.escapeMarkdown(bar)}\n\n`;
 
     // Section RISQUES si des risques sont identifiés
     const risks = this.extractRisks(analysis);
@@ -170,12 +171,12 @@ export class TelegramNotifier {
 
     // Breakdown du score (optionnel, peut être commenté si trop long)
     message += `📊 *Breakdown:*\n`;
-    message += `• Social: ${analysis.breakdown.socialScore}pts\n`;
-    message += `• Bonding Curve: ${analysis.breakdown.bondingCurveScore}pts\n`;
-    message += `• Anti\\-Rug: ${analysis.breakdown.antiRugScore}pts\n`;
-    message += `• Holders: ${analysis.breakdown.holdersScore}pts\n`;
+    message += `• Social: ${this.escapeMarkdown(String(analysis.breakdown.socialScore))}pts\n`;
+    message += `• Bonding Curve: ${this.escapeMarkdown(String(analysis.breakdown.bondingCurveScore))}pts\n`;
+    message += `• Anti\\-Rug: ${this.escapeMarkdown(String(analysis.breakdown.antiRugScore))}pts\n`;
+    message += `• Holders: ${this.escapeMarkdown(String(analysis.breakdown.holdersScore))}pts\n`;
     if (analysis.breakdown.devHoldingPenalty < 0) {
-      message += `• Dev Holding: ${analysis.breakdown.devHoldingPenalty}pts\n`;
+      message += `• Dev Holding: ${this.escapeMarkdown(String(analysis.breakdown.devHoldingPenalty))}pts\n`;
     }
 
     return message;

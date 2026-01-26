@@ -3,7 +3,6 @@
  * @module index
  */
 
-import WebSocket from 'ws';
 import chalk from 'chalk';
 import dotenv from 'dotenv';
 import { loadSettings, validateSettings, type AppSettings } from './config/settings.js';
@@ -109,7 +108,6 @@ class TokenScanner {
   private settings: AppSettings;
   private notifier: ReturnType<typeof createNotifier>;
   private performanceLogger: PerformanceLogger;
-  private ws: WebSocket | null = null;
   private solPriceCache: number | null = null;
   private solPriceCacheTime: number = 0;
   private readonly SOL_PRICE_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
@@ -285,10 +283,22 @@ class TokenScanner {
       ]);
 
       // Analyser le token avec les holders (Shadow Scan activé)
+      console.log(chalk.blue(`   📊 Analyse en cours...`));
       const analysis = await validateToken(tokenData, {
         solPriceUsd: solPrice,
         holders: holders.length > 0 ? holders : undefined,
       });
+
+      // Afficher le score détaillé
+      const scoreColor = analysis.score >= 70 ? chalk.green : analysis.score >= 50 ? chalk.yellow : chalk.red;
+      console.log(scoreColor(`   📈 Score: ${analysis.score}/100`));
+      console.log(chalk.gray(`      - Social: ${analysis.breakdown.socialScore}pts`));
+      console.log(chalk.gray(`      - Bonding Curve: ${analysis.breakdown.bondingCurveScore}pts`));
+      console.log(chalk.gray(`      - Anti-Rug: ${analysis.breakdown.antiRugScore}pts`));
+      console.log(chalk.gray(`      - Holders: ${analysis.breakdown.holdersScore}pts`));
+      if (analysis.breakdown.devHoldingPenalty < 0) {
+        console.log(chalk.red(`      - Dev Holding: ${analysis.breakdown.devHoldingPenalty}pts`));
+      }
 
       // Détecter les scams via holders (score très bas à cause des pénalités holders)
       const isScamDetected = 
@@ -298,22 +308,35 @@ class TokenScanner {
 
       if (isScamDetected) {
         console.log(
-          chalk.red.bold(`\n[SCAM DETECTED] `) +
-          chalk.red(`${tokenData.address} - Score: ${analysis.score}/100`) +
+          chalk.red.bold(`\n   🚨 [SCAM DETECTED] `) +
+          chalk.red(`Score: ${analysis.score}/100`) +
           chalk.gray(` (Holders: ${analysis.breakdown.holdersScore}pts)`)
         );
         // Afficher les raisons du scam
         analysis.reasons
           .filter(r => r.includes('🚨') || r.includes('CRITIQUE') || r.includes('dump'))
           .forEach(reason => {
-            console.log(chalk.red(`  └─ ${reason}`));
+            console.log(chalk.red(`      └─ ${reason}`));
           });
       }
 
       // Si c'est une alerte alpha, envoyer la notification
       if (analysis.isAlphaAlert) {
-        await this.notifier.sendAlert(tokenData, analysis);
-        isAlert = true;
+        console.log(chalk.green.bold(`\n   🚨 ALERTE ALPHA DÉTECTÉE ! Envoi de la notification...`));
+        try {
+          await this.notifier.sendAlert(tokenData, analysis);
+          isAlert = true;
+          console.log(chalk.green('   ✅ Notification envoyée avec succès\n'));
+        } catch (error) {
+          console.error(chalk.red(`   ❌ Erreur envoi: ${error instanceof Error ? error.message : error}\n`));
+        }
+      } else {
+        console.log(chalk.yellow(`   ⚪ Pas d'alerte (score ${analysis.score} < 70)`));
+        // Afficher les raisons du rejet pour debug
+        if (analysis.reasons.length > 0) {
+          console.log(chalk.gray(`      Raisons: ${analysis.reasons.slice(0, 3).join(', ')}`));
+        }
+        console.log(''); // Ligne vide
       }
 
       const processingTime = Date.now() - startTime;
@@ -337,123 +360,45 @@ class TokenScanner {
     }
   }
 
-  /**
-   * Parse un message pumpportal.fun au format 'subscribeNewToken'
-   * @param {unknown} message - Message brut du WebSocket
-   * @returns {TokenData | null} Données du token ou null si format invalide
-   */
-  private parsePumpPortalMessage(message: unknown): TokenData | null {
-    if (!message || typeof message !== 'object') {
-      return null;
-    }
-
-    const msg = message as Record<string, unknown>;
-
-    // Vérifier que c'est un message de type 'subscribeNewToken'
-    if (msg['type'] !== 'subscribeNewToken' && msg['event'] !== 'subscribeNewToken') {
-      return null;
-    }
-
-    // Extraire les données du token depuis le format pumpportal.fun
-    const data = (msg['data'] || msg) as Record<string, unknown>;
-    const metadata = (data['metadata'] as Record<string, unknown>) || {};
-    const social = (data['social'] as Record<string, unknown>) || {};
-    const reserves = (data['reserves'] as Record<string, unknown>) || {};
-
-    const tokenData: TokenData = {
-      address: (data['mint'] || data['address'] || data['token'] || '') as string,
-      freeMint: data['freeMint'] as boolean | undefined,
-      devHolding: data['devHolding'] as number | undefined,
-      metadata: {
-        name: (data['name'] || metadata['name']) as string | undefined,
-        symbol: (data['symbol'] || metadata['symbol']) as string | undefined,
-        description: (data['description'] || metadata['description']) as string | undefined,
-        image: (data['image'] || metadata['image'] || data['imageUrl']) as string | undefined,
-        social: {
-          twitter: (data['twitter'] || social['twitter'] || data['twitterUrl']) as string | undefined,
-          telegram: (data['telegram'] || social['telegram'] || data['telegramUrl']) as string | undefined,
-          website: (data['website'] || social['website'] || data['websiteUrl']) as string | undefined,
-        },
-      },
-      reserves: {
-        vSolReserves: (data['vSolReserves'] || reserves['vSolReserves'] || data['virtualSolReserves'] || 0) as number,
-        tokenReserves: (data['tokenReserves'] || reserves['tokenReserves'] || data['virtualTokenReserves'] || 0) as number,
-      },
-    };
-
-    return tokenData;
-  }
 
   /**
-   * Démarre la connexion WebSocket vers pumpportal.fun
+   * Démarre le scanner en utilisant Helius WebSocket pour surveiller pump.fun
+   * Utilise programSubscribe selon la doc Helius: https://www.helius.dev/docs/api-reference/rpc/websocket-methods
    */
   async start(): Promise<void> {
-    console.log(chalk.blue('🔌 Connexion au WebSocket pumpportal.fun...'));
+    console.log(chalk.blue('🔌 Démarrage du scanner pump.fun via Helius WebSocket...'));
+    
+    // Import dynamique pour éviter les problèmes de dépendances circulaires
+    const { SolanaMonitor } = await import('./services/solanaMonitor.js');
 
-    const wsUrl = process.env['WEBSOCKET_URL'] || 'wss://pumpportal.fun/api/data';
+    const monitor = new SolanaMonitor(this.settings.solana);
 
-    return new Promise((resolve, reject) => {
-      try {
-        this.ws = new WebSocket(wsUrl);
+    try {
+      await monitor.start((tokenData) => {
+        // Callback appelé lorsqu'un nouveau token est détecté
+        console.log(chalk.green(`\n🎯 NOUVEAU TOKEN DÉTECTÉ via Helius !`));
+        console.log(chalk.cyan(`   Nom: ${tokenData.metadata?.name || 'N/A'}`));
+        console.log(chalk.cyan(`   Symbol: ${tokenData.metadata?.symbol || 'N/A'}`));
+        console.log(chalk.gray(`   Adresse: ${tokenData.address}`));
 
-        this.ws.on('open', () => {
-          console.log(chalk.green('✅ WebSocket connecté à pumpportal.fun'));
-          console.log(chalk.blue('👂 En attente de nouveaux tokens...\n'));
-          resolve();
+        // Traiter le token
+        this.processToken(tokenData).catch((error) => {
+          console.error(chalk.red('Erreur dans processToken:'), error);
         });
+      });
 
-        this.ws.on('message', async (data: WebSocket.Data) => {
-          try {
-            const message = JSON.parse(data.toString());
-            
-            // Parser le message au format pumpportal.fun
-            const tokenData = this.parsePumpPortalMessage(message);
-            
-            if (!tokenData || !tokenData.address) {
-              // Ignorer les messages qui ne sont pas des nouveaux tokens
-              return;
-            }
-
-            // Traiter le token de manière asynchrone (non-bloquant)
-            this.processToken(tokenData).catch((error) => {
-              console.error(chalk.red('Erreur dans processToken:'), error);
-            });
-          } catch (error) {
-            // Ignorer les erreurs de parsing silencieusement (peut être un message de heartbeat, etc.)
-            if (error instanceof SyntaxError) {
-              // Message non-JSON, probablement un heartbeat
-              return;
-            }
-            console.error(chalk.red('Erreur lors du parsing du message WebSocket:'), error);
-          }
-        });
-
-        this.ws.on('error', (error) => {
-          console.error(chalk.red('❌ Erreur WebSocket:'), error);
-          reject(error);
-        });
-
-        this.ws.on('close', () => {
-          console.log(chalk.yellow('⚠️ WebSocket fermé, reconnexion...'));
-          // Reconnexion automatique après 5 secondes
-          setTimeout(() => {
-            this.start().catch(reject);
-          }, 5000);
-        });
-      } catch (error) {
-        reject(error);
-      }
-    });
+      console.log(chalk.green('✅ Surveillance Helius WebSocket activée'));
+      console.log(chalk.blue('👂 En attente de nouveaux tokens pump.fun...\n'));
+    } catch (error) {
+      console.error(chalk.red('❌ Erreur lors de la connexion Helius WebSocket:'), error);
+      console.log(chalk.yellow('\n⚠️  Fallback: Le scanner ne peut pas surveiller les nouveaux tokens automatiquement.\n'));
+    }
   }
 
   /**
    * Arrête le scanner
    */
   stop(): void {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
     this.performanceLogger.printStats();
   }
 }

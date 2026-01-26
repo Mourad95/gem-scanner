@@ -8,6 +8,28 @@ import axios from 'axios';
 import type { SolanaConfig } from '../config/settings.js';
 
 /**
+ * Prépare les headers pour une requête RPC Solana
+ * Gère correctement les URLs Helius qui incluent la clé API dans l'URL
+ * @param {SolanaConfig} solana - Configuration Solana
+ * @returns {Record<string, string>} Headers à utiliser
+ */
+function prepareRpcHeaders(solana: SolanaConfig): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  // Si l'URL contient déjà une clé API (format Helius), ne pas ajouter de header Authorization
+  const hasApiKeyInUrl = solana.rpcUrl.includes('api-key=') || solana.rpcUrl.includes('apikey=');
+  
+  // Si pas de clé dans l'URL et qu'on a une clé séparée, l'utiliser comme header
+  if (!hasApiKeyInUrl && solana.rpcKey) {
+    headers['Authorization'] = `Bearer ${solana.rpcKey}`;
+  }
+
+  return headers;
+}
+
+/**
  * Données d'un holder
  */
 export interface HolderData {
@@ -62,10 +84,7 @@ async function fetchTokenSupply(
         params: [tokenAddress],
       },
       {
-        headers: {
-          'Content-Type': 'application/json',
-          ...(solana.rpcKey && { Authorization: `Bearer ${solana.rpcKey}` }),
-        },
+        headers: prepareRpcHeaders(solana),
         timeout: 2000, // Timeout court pour la supply
         signal, 
       }
@@ -109,10 +128,7 @@ export async function fetchTokenHolders(
           params: [tokenAddress],
         },
         {
-          headers: {
-            'Content-Type': 'application/json',
-            ...(solana.rpcKey && { Authorization: `Bearer ${solana.rpcKey}` }),
-          },
+          headers: prepareRpcHeaders(solana),
           timeout: 2500, // On laisse un peu plus de temps pour les comptes que pour la supply
           signal, 
         }

@@ -6,6 +6,7 @@
 import axios from 'axios';
 import type { HolderData } from './holderService.js';
 import { PUMP_CURVE_ADDRESS } from './holderService.js';
+import { analyzeTokenSemantics } from './aiService.js';
 
 /**
  * Informations sociales du token
@@ -507,6 +508,44 @@ export async function validateToken(
   }
 
   totalScore += holdersScore;
+
+  // Calcul du score préliminaire (avant analyse IA)
+  const preliminaryScore = totalScore;
+  const isInAlphaZone = progress >= BONDING_CURVE_ALPHA_MIN && progress <= BONDING_CURVE_ALPHA_MAX;
+
+  // Analyse IA : UNIQUEMENT si preliminaryScore > 50 OU si le token est en zone Alpha
+  // Ne gaspille pas de CPU sur les tokens faibles
+  let aiScoreModifier = 0;
+  if (preliminaryScore > 50 || isInAlphaZone) {
+    try {
+      const aiResult = await analyzeTokenSemantics(
+        token.metadata?.name,
+        token.metadata?.symbol,
+        token.metadata?.description
+      );
+
+      // Intégration des résultats de l'IA au score final
+      if (aiResult.sentimentScore > 80) {
+        aiScoreModifier += 10; // Narratif fort détecté
+        reasons.push(`🤖 AI: Narratif '${aiResult.narrative}' détecté (sentiment: ${aiResult.sentimentScore})`);
+      } else if (aiResult.narrative && aiResult.narrative !== 'Unknown') {
+        reasons.push(`🤖 AI: Narratif '${aiResult.narrative}' détecté (sentiment: ${aiResult.sentimentScore})`);
+      }
+
+      if (aiResult.isLowEffort) {
+        aiScoreModifier -= 20; // Arnaque probable (description générique ChatGPT)
+        reasons.push(`🚨 AI: Contenu faible effort détecté (${aiResult.riskLabel})`);
+      } else if (aiResult.riskLabel && aiResult.riskLabel !== 'Neutral') {
+        reasons.push(`⚠️ AI: Risque '${aiResult.riskLabel}' détecté`);
+      }
+    } catch (error) {
+      // En cas d'erreur, continuer sans modifier le score (ne jamais bloquer le scanner)
+      console.warn('[Analyzer] Erreur lors de l\'analyse IA:', error);
+    }
+  }
+
+  // Appliquer la modification du score IA
+  totalScore += aiScoreModifier;
 
   // Calcul du Market Cap
   const marketCap = calculateMarketCap(token.reserves, solPriceUsd);
