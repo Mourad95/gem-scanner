@@ -14,6 +14,7 @@
     "test:ui": "vitest --ui",
     "test:telegram": "tsx src/test-telegram.ts",
     "test:pumpportal": "tsx src/test-pumpportal.ts",
+    "test:ai": "tsx src/test-ai.ts",
     "get-chat-id": "tsx src/get-chat-id.ts",
     "debug:telegram": "tsx src/debug-telegram.ts"
   },

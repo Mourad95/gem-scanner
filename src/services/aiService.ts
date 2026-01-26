@@ -10,7 +10,7 @@ import axios from 'axios';
  */
 const OLLAMA_API_URL = 'http://localhost:11434/api/generate';
 const OLLAMA_MODEL = 'qwen2.5:0.5b';
-const OLLAMA_TIMEOUT = 1500; // 1.5 secondes - timeout strict
+const OLLAMA_TIMEOUT = 3000; // 3 secondes - timeout pour permettre au modèle de répondre
 const OLLAMA_TEMPERATURE = 0.1; // Pour des réponses déterministes et rapides
 
 /**
@@ -74,7 +74,7 @@ Description: ${truncatedDescription || 'N/A'}`;
         },
       },
       {
-        timeout: OLLAMA_TIMEOUT, // Timeout strict de 1500ms
+        timeout: OLLAMA_TIMEOUT, // Timeout de 3000ms
       }
     );
 
@@ -111,7 +111,7 @@ Description: ${truncatedDescription || 'N/A'}`;
     // Ne jamais bloquer le scanner
     if (axios.isAxiosError(error)) {
       if (error.code === 'ECONNABORTED') {
-        console.warn('[AI Service] Timeout Ollama (>1500ms) - utilisation de la valeur par défaut');
+        console.warn('[AI Service] Timeout Ollama (>3000ms) - utilisation de la valeur par défaut');
       } else {
         console.warn('[AI Service] Erreur Ollama:', error.message);
       }
