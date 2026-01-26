@@ -1,5 +1,6 @@
 /**
  * Service d'analyse et de validation de tokens Solana
+ * MODE "SNIPER ÉLITE" : Filtrage strict pour éviter les faux positifs
  * @module services/analyzer
  */
 
@@ -53,7 +54,7 @@ export interface TokenData {
  */
 export interface TokenAnalysisResult {
   score: number; // Score de 0 à 100
-  isAlphaAlert: boolean; // True si score > 70
+  isAlphaAlert: boolean; // True si score > 55
   marketCap: number; // Market Cap calculé en USD
   bondingCurveProgress: number; // Progrès de la bonding curve (0-100)
   breakdown: {
@@ -91,28 +92,60 @@ const BONDING_CURVE_ALPHA_MAX = 60; // Zone alpha se termine à 60%
 const BONDING_CURVE_RISK_THRESHOLD = 80; // Au-delà de 80%, risque de dump
 const DEV_HOLDING_MAX = 10; // Si dev > 10%, pénalité
 const DEV_HOLDING_PENALTY = 50; // Pénalité si dev > 10%
-const ALPHA_ALERT_THRESHOLD = 70;
+const ALPHA_ALERT_THRESHOLD = 60; // Mode "Sniper Élite" : Seuil très strict pour filtrer le bruit
+
+/**
+ * Blacklist sémantique : Mots interdits dans le nom ou le symbole du token
+ * Kill Switch : Si un mot interdit est trouvé, pénalité de -100 points immédiate
+ */
+const BLACKLIST_WORDS = [
+  'test',
+  'shit',
+  'cum',
+  'tits',
+  'dick',
+  'ass',
+  'sex',
+  'bot',
+  'gamble',
+  'scam',
+  'rug',
+  'pussy',
+  '1111',
+  'bitch',
+  'fucker',
+  'minoor',
+  'nigga',
+  'nigger',
+  'faggot',
+] as const;
 
 /**
  * Seuils pour l'analyse des holders
  */
 const HOLDERS_TOP10_MAX = 30; // Si Top 10 > 30%, pénalité lourde
 const HOLDERS_TOP10_GOOD = 15; // Si Top 10 < 15%, bonne distribution
-const HOLDERS_SINGLE_WALLET_MAX = 10; // Si un seul wallet > 10%, pénalité critique
+const HOLDERS_SINGLE_WALLET_MAX = 30; // Si un seul wallet > 30%, pénalité critique
 const HOLDERS_TOP10_PENALTY = 40; // Pénalité si Top 10 > 30%
-const HOLDERS_SINGLE_WALLET_PENALTY = 50; // Pénalité si un wallet > 10%
+const HOLDERS_SINGLE_WALLET_PENALTY = 50; // Pénalité si un wallet > 30%
 
 /**
  * Points attribués pour chaque critère
- * Rééquilibré pour que le Shadow Scan (holders) pèse 40% de la note finale
+ * Mode "Sniper Élite" : Scoring strict
  */
 const SCORING = {
-  SOCIAL_PRESENCE: 15, // Twitter ET Telegram présents (vérifiés) - réduit de 40 à 15
-  BONDING_CURVE_ALPHA: 12, // Zone alpha (15-60%) - réduit de 30 à 12
-  BONDING_CURVE_GOOD: 6, // Zone acceptable (5-15% ou 60-80%) - réduit de 15 à 6
-  ANTI_RUG: 15, // freeMint false + metadata cohérentes + liens valides - réduit de 40 à 15
-  HOLDERS_EXCELLENT: 40, // Excellente distribution (Top 10 < 15%) - Shadow Scan 40%
-  HOLDERS_GOOD: 20, // Bonne distribution (Top 10 < 30%) - Shadow Scan 40%
+  SOCIAL_TWITTER: 20, // Twitter présent et valide
+  SOCIAL_TELEGRAM: 15, // Telegram présent et valide
+  SOCIAL_WEBSITE: 10, // Website présent et valide
+  SOCIAL_BONUS_ALL: 10, // Bonus Trifecta (Twitter + Telegram + Website)
+  BONDING_CURVE_ALPHA: 12, // Zone alpha (15-60%)
+  BONDING_CURVE_GOOD: 6, // Zone acceptable (5-15% ou 60-80%)
+  ANTI_RUG_BASIC: 10, // Nom + Symbole présents
+  ANTI_RUG_IMAGE: 10, // Image présente
+  FRESH_MINT_BONUS: 20, // Bonus pour mint très récent (< 2% bonding curve)
+  HOLDERS_EXCELLENT: 40, // Excellente distribution (Top 10 < 15%)
+  HOLDERS_GOOD: 20, // Bonne distribution (Top 10 < 30%)
+  HOLDERS_NEUTRAL: 10, // Score neutre si holders vides (Block 0)
 } as const;
 
 /**
@@ -166,27 +199,6 @@ export async function fetchSolPrice(): Promise<number> {
   }
 }
 
-/**
- * Vérifie si un lien Twitter est valide
- * @param {string} url - URL à vérifier
- * @returns {boolean} True si le lien est valide
- */
-function isValidTwitterLink(url: string): boolean {
-  // Regex pour Twitter/X : https://twitter.com/... ou https://x.com/...
-  const twitterRegex = /^https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/i;
-  return twitterRegex.test(url);
-}
-
-/**
- * Vérifie si un lien Telegram est valide
- * @param {string} url - URL à vérifier
- * @returns {boolean} True si le lien est valide
- */
-function isValidTelegramLink(url: string): boolean {
-  // Regex pour Telegram : https://t.me/... ou https://telegram.me/...
-  const telegramRegex = /^https?:\/\/(t\.me|telegram\.me)\/[a-zA-Z0-9_]+/i;
-  return telegramRegex.test(url);
-}
 
 /**
  * Calcule le progrès de la bonding curve pump.fun
@@ -214,10 +226,15 @@ export function calculateBondingCurveProgress(reserves?: TokenReserves): number 
  * Formule : (vSolReserves / vTokenReserves) * 1,000,000,000 * currentSolPrice
  * @param {TokenReserves} reserves - Réserves du token
  * @param {number} solPriceUsd - Prix du SOL en USD
- * @returns {number} Market Cap en USD
+ * @returns {number} Market Cap en USD (0 si données manquantes)
  */
 export function calculateMarketCap(reserves?: TokenReserves, solPriceUsd: number = 100): number {
-  if (!reserves || reserves.vSolReserves <= 0 || reserves.tokenReserves <= 0) {
+  // Gérer proprement les cas où les données manquent
+  if (!reserves) {
+    return 0;
+  }
+
+  if (reserves.vSolReserves <= 0 || reserves.tokenReserves <= 0) {
     return 0;
   }
 
@@ -228,34 +245,90 @@ export function calculateMarketCap(reserves?: TokenReserves, solPriceUsd: number
 }
 
 /**
- * Vérifie la présence sociale du token avec validation des liens
- * @param {TokenMetadata} metadata - Métadonnées du token
- * @returns {number} Score de présence sociale (0 ou 40)
+ * Vérifie si un lien Twitter est valide (fonction utilitaire exportée pour réutilisation)
  */
-function evaluateSocialPresence(metadata?: TokenMetadata): number {
-  if (!metadata?.social) {
-    return 0;
-  }
-
-  const { twitter, telegram } = metadata.social;
-
-  // Les deux doivent être présents ET valides pour obtenir les points
-  if (twitter && telegram) {
-    const twitterValid = isValidTwitterLink(twitter);
-    const telegramValid = isValidTelegramLink(telegram);
-
-    if (twitterValid && telegramValid) {
-      return SCORING.SOCIAL_PRESENCE;
-    }
-  }
-
-  return 0;
+export function isValidTwitterLink(url: string): boolean {
+  // Regex pour Twitter/X : https://twitter.com/... ou https://x.com/...
+  const twitterRegex = /^https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/i;
+  return twitterRegex.test(url);
 }
 
 /**
- * Évalue la bonding curve du token avec les nouvelles règles
+ * Vérifie si un lien Telegram est valide (fonction utilitaire exportée pour réutilisation)
+ */
+export function isValidTelegramLink(url: string): boolean {
+  // Regex pour Telegram : https://t.me/... ou https://telegram.me/...
+  const telegramRegex = /^https?:\/\/(t\.me|telegram\.me)\/[a-zA-Z0-9_]+/i;
+  return telegramRegex.test(url);
+}
+
+/**
+ * Vérifie la présence sociale du token avec validation des liens
+ * MODE "SNIPER ÉLITE" : Twitter seul insuffisant pour déclencher une alerte
+ * @param {TokenMetadata} metadata - Métadonnées du token
+ * @returns {{ score: number, reasons: string[] }} Score de présence sociale et raisons
+ */
+function evaluateSocialPresence(metadata?: TokenMetadata): { score: number; reasons: string[] } {
+  const reasons: string[] = [];
+  let score = 0;
+
+  if (!metadata?.social) {
+    return { score: 0, reasons: [] };
+  }
+
+  const { twitter, telegram, website } = metadata.social;
+  let hasTwitter = false;
+  let hasTelegram = false;
+  let hasWebsite = false;
+
+  // Twitter : +20 pts si présent et valide
+  if (twitter) {
+    const twitterValid = isValidTwitterLink(twitter);
+    if (twitterValid) {
+      score += SCORING.SOCIAL_TWITTER;
+      hasTwitter = true;
+      reasons.push(`✅ Twitter présent`);
+    }
+  }
+
+  // Telegram : +15 pts si présent et valide
+  if (telegram) {
+    const telegramValid = isValidTelegramLink(telegram);
+    if (telegramValid) {
+      score += SCORING.SOCIAL_TELEGRAM;
+      hasTelegram = true;
+      reasons.push(`✅ Telegram présent`);
+    }
+  }
+
+  // Website : +10 pts si présent et valide
+  if (website) {
+    // Vérifier que c'est une URL valide
+    try {
+      const url = new URL(website);
+      if (url.protocol === 'http:' || url.protocol === 'https:') {
+        score += SCORING.SOCIAL_WEBSITE;
+        hasWebsite = true;
+        reasons.push(`✅ Website présent`);
+      }
+    } catch {
+      // URL invalide, ignorer
+    }
+  }
+
+  // Bonus Trifecta : +10 pts si les trois sont présents
+  if (hasTwitter && hasTelegram && hasWebsite) {
+    score += SCORING.SOCIAL_BONUS_ALL;
+    reasons.push(`🎯 Bonus Trifecta (Twitter + Telegram + Website)`);
+  }
+
+  return { score, reasons };
+}
+
+/**
+ * Évalue la bonding curve du token
  * @param {TokenReserves} reserves - Réserves du token
- * @returns {number} Score de bonding curve (0 à 30)
+ * @returns {number} Score de bonding curve (0 à 12)
  */
 function evaluateBondingCurve(reserves?: TokenReserves): number {
   if (!reserves) {
@@ -285,44 +358,64 @@ function evaluateBondingCurve(reserves?: TokenReserves): number {
 
 /**
  * Évalue les mesures anti-rug du token
+ * MODE "SNIPER ÉLITE" : Vérifie la blacklist sémantique (name ET symbol)
+ * Kill Switch : Pénalité de -100 points si mot interdit trouvé
  * @param {TokenData} token - Données du token
- * @returns {number} Score anti-rug (0 à 40)
+ * @returns {{ score: number; blacklistPenalty: number; blacklistReason: string | null }} Score anti-rug et pénalité blacklist
  */
-function evaluateAntiRug(token: TokenData): number {
+function evaluateAntiRug(token: TokenData): {
+  score: number;
+  blacklistPenalty: number;
+  blacklistReason: string | null;
+} {
   let score = 0;
+  let blacklistPenalty = 0;
+  let blacklistReason: string | null = null;
+
+  // Vérification de la blacklist sémantique (insensible à la casse)
+  // Vérifier dans le NOM ET le SYMBOLE
+  const metadata = token.metadata;
+  if (metadata) {
+    const nameLower = metadata.name?.toLowerCase() || '';
+    const symbolLower = metadata.symbol?.toLowerCase() || '';
+    
+    // Chercher un mot interdit dans le nom
+    const blacklistedWordInName = BLACKLIST_WORDS.find((word) => nameLower.includes(word.toLowerCase()));
+    
+    // Chercher un mot interdit dans le symbole
+    const blacklistedWordInSymbol = BLACKLIST_WORDS.find((word) => symbolLower.includes(word.toLowerCase()));
+    
+    const blacklistedWord = blacklistedWordInName || blacklistedWordInSymbol;
+    
+    if (blacklistedWord) {
+      blacklistPenalty = -100; // Kill Switch : Pénalité massive de -100 points
+      blacklistReason = `⛔ BLACKLIST: Mot interdit détecté ("${blacklistedWord}")`;
+    }
+  }
 
   // Vérification freeMint : si false ou non défini (considéré comme sécurisé)
   if (token.freeMint === false || token.freeMint === undefined) {
-    score += 20;
+    // Pas de points pour freeMint dans cette version simplifiée
   }
 
   // Vérification de la cohérence des métadonnées
-  const metadata = token.metadata;
   if (metadata) {
     const hasName = Boolean(metadata.name && metadata.name.trim().length > 0);
     const hasSymbol = Boolean(metadata.symbol && metadata.symbol.trim().length > 0);
-    const hasDescription = Boolean(metadata.description && metadata.description.trim().length > 0);
     const hasImage = Boolean(metadata.image);
 
-    // Si toutes les métadonnées essentielles sont présentes
-    if (hasName && hasSymbol && hasDescription && hasImage) {
-      score += 20;
-    } else if (hasName && hasSymbol) {
-      // Au moins les métadonnées de base
-      score += 10;
+    // ANTI_RUG_BASIC : Nom + Symbole = +10 pts
+    if (hasName && hasSymbol) {
+      score += SCORING.ANTI_RUG_BASIC;
     }
 
-    // Vérification des liens sociaux (déjà fait dans evaluateSocialPresence mais on peut ajouter des points ici)
-    if (metadata.social) {
-      const { twitter, telegram } = metadata.social;
-      if (twitter && isValidTwitterLink(twitter) && telegram && isValidTelegramLink(telegram)) {
-        // Les liens sont déjà comptés dans socialScore, mais on peut ajouter un bonus anti-rug
-        score += 5;
-      }
+    // ANTI_RUG_IMAGE : Image présente = +10 pts
+    if (hasImage) {
+      score += SCORING.ANTI_RUG_IMAGE;
     }
   }
 
-  return Math.min(score, SCORING.ANTI_RUG);
+  return { score, blacklistPenalty, blacklistReason };
 }
 
 /**
@@ -344,27 +437,30 @@ function evaluateDevHolding(token: TokenData): number {
 
 /**
  * Évalue la distribution des holders (Shadow Scan)
+ * MODE "SNIPER ÉLITE" : Si holders vides (Block 0), score neutre (0 ou +10), pas de bonus excessif
  * @param {HolderData[]} holders - Liste des holders
  * @param {string} devAddress - Adresse officielle du développeur (optionnelle)
  * @returns {number} Score de distribution (-50 à +40)
  */
 function evaluateHolders(holders: HolderData[], devAddress?: string): number {
   if (!holders || holders.length === 0) {
-    return 0; // Pas de données disponibles
+    // Cas fréquent au Block 0 : score neutre, pas de bonus excessif
+    return SCORING.HOLDERS_NEUTRAL; // +10 pts neutre
   }
 
   // Filtrer l'adresse de la bonding curve pump.fun
   const realHolders = holders.filter((h) => h.address !== PUMP_CURVE_ADDRESS);
 
   if (realHolders.length === 0) {
-    return 0;
+    // Même si la liste n'est pas vide mais qu'après filtrage il n'y a rien, score neutre
+    return SCORING.HOLDERS_NEUTRAL; // +10 pts neutre
   }
 
   // Calculer le pourcentage total détenu par le Top 10
   const top10Holders = realHolders.slice(0, 10);
   const top10Percentage = top10Holders.reduce((acc, curr) => acc + curr.percentage, 0);
 
-  // Vérifier si un seul wallet (hors dev) possède > 10%
+  // Vérifier si un seul wallet (hors dev) possède > 30%
   const singleWalletRisk = realHolders.find((holder) => {
     // Exclure le dev officiel si son adresse est fournie
     if (devAddress && holder.address === devAddress) {
@@ -373,7 +469,7 @@ function evaluateHolders(holders: HolderData[], devAddress?: string): number {
     return holder.percentage > HOLDERS_SINGLE_WALLET_MAX;
   });
 
-  // Pénalité critique : un seul wallet > 10%
+  // Pénalité critique : un seul wallet > 30%
   if (singleWalletRisk) {
     return -HOLDERS_SINGLE_WALLET_PENALTY; // -50 points
   }
@@ -394,6 +490,7 @@ function evaluateHolders(holders: HolderData[], devAddress?: string): number {
 
 /**
  * Valide un token et retourne un score de 0 à 100
+ * MODE "SNIPER ÉLITE" : Filtrage strict pour éviter les faux positifs
  * @param {TokenData} token - Données du token à analyser
  * @param {ValidateTokenOptions} options - Options de validation (prix SOL, etc.)
  * @returns {Promise<TokenAnalysisResult>} Résultat de l'analyse avec score et détails
@@ -418,13 +515,14 @@ export async function validateToken(
   }
 
   // Évaluation de la présence sociale
-  const socialScore = evaluateSocialPresence(token.metadata);
+  const socialResult = evaluateSocialPresence(token.metadata);
+  const socialScore = socialResult.score;
   totalScore += socialScore;
-  if (socialScore > 0) {
-    reasons.push('✅ Présence sociale complète (Twitter + Telegram vérifiés)');
-  } else {
+  reasons.push(...socialResult.reasons);
+  
+  if (socialScore === 0) {
     const social = token.metadata?.social;
-    if (social?.twitter || social?.telegram) {
+    if (social?.twitter || social?.telegram || social?.website) {
       reasons.push('⚠️ Présence sociale incomplète ou liens invalides');
     } else {
       reasons.push('❌ Présence sociale absente');
@@ -446,13 +544,24 @@ export async function validateToken(
     reasons.push('❌ Bonding curve non disponible ou trop tôt');
   }
 
-  // Évaluation anti-rug
-  const antiRugScore = evaluateAntiRug(token);
+  // Évaluation anti-rug (avec blacklist)
+  const antiRugResult = evaluateAntiRug(token);
+  const antiRugScore = antiRugResult.score;
   totalScore += antiRugScore;
-  if (antiRugScore >= SCORING.ANTI_RUG) {
-    reasons.push('✅ Mesures anti-rug complètes');
-  } else if (antiRugScore >= SCORING.ANTI_RUG / 2) {
-    reasons.push('⚠️ Mesures anti-rug partielles');
+  
+  // Appliquer la pénalité blacklist (Kill Switch : -100 points)
+  if (antiRugResult.blacklistPenalty < 0) {
+    totalScore += antiRugResult.blacklistPenalty;
+    if (antiRugResult.blacklistReason) {
+      reasons.push(antiRugResult.blacklistReason);
+    }
+  }
+  
+  const maxAntiRugScore = SCORING.ANTI_RUG_BASIC + SCORING.ANTI_RUG_IMAGE; // 20 points max
+  if (antiRugScore >= maxAntiRugScore) {
+    reasons.push('✅ Mesures anti-rug complètes (Nom + Symbole + Image)');
+  } else if (antiRugScore >= SCORING.ANTI_RUG_BASIC) {
+    reasons.push('⚠️ Mesures anti-rug partielles (Nom + Symbole)');
   } else {
     reasons.push('❌ Mesures anti-rug insuffisantes');
   }
@@ -466,48 +575,59 @@ export async function validateToken(
     reasons.push(`✅ Détention développeur acceptable (${token.devHolding}%)`);
   }
 
-  // Évaluation de la distribution des holders (Shadow Scan - 40% du score)
+  // Évaluation de la distribution des holders (Shadow Scan)
   let holdersScore = 0;
   let holders: HolderData[] | undefined = options.holders;
 
-  // Si les holders ne sont pas fournis, essayer de les récupérer
-  // Note: En production, vous devriez toujours fournir les holders via options
-  // pour éviter les appels API supplémentaires
   if (!holders) {
     // Les holders devront être récupérés par l'appelant via holderService
-    // Pour l'instant, on continue sans pénalité si non disponibles
     reasons.push('⚠️ Analyse des holders non disponible (Shadow Scan ignoré)');
   } else {
     holdersScore = evaluateHolders(holders, options.devAddress);
 
-    // Calculer le Top 10 pour les messages
-    const realHolders = holders.filter((h) => h.address !== PUMP_CURVE_ADDRESS);
-    const top10Holders = realHolders.slice(0, 10);
-    const top10Percentage = top10Holders.reduce((acc, curr) => acc + curr.percentage, 0);
+    // Calculer le Top 10 pour les messages (si holders non vide)
+    if (holders.length > 0) {
+      const realHolders = holders.filter((h) => h.address !== PUMP_CURVE_ADDRESS);
+      const top10Holders = realHolders.slice(0, 10);
+      const top10Percentage = top10Holders.reduce((acc, curr) => acc + curr.percentage, 0);
 
-    if (holdersScore === -HOLDERS_SINGLE_WALLET_PENALTY) {
-      const riskyHolder = realHolders.find(
-        (h) => h.percentage > HOLDERS_SINGLE_WALLET_MAX && h.address !== options.devAddress
-      );
+      if (holdersScore === -HOLDERS_SINGLE_WALLET_PENALTY) {
+        const riskyHolder = realHolders.find(
+          (h) => h.percentage > HOLDERS_SINGLE_WALLET_MAX && h.address !== options.devAddress
+        );
+        reasons.push(
+          `🚨 CRITIQUE: Un wallet détient ${riskyHolder?.percentage.toFixed(2)}% (risque de dump massif)`
+        );
+      } else if (holdersScore === -HOLDERS_TOP10_PENALTY) {
+        reasons.push(
+          `🚨 Pénalité: Top 10 détient ${top10Percentage.toFixed(2)}% (concentration trop élevée)`
+        );
+      } else if (holdersScore === SCORING.HOLDERS_EXCELLENT) {
+        reasons.push(
+          `✅ Excellente distribution: Top 10 détient ${top10Percentage.toFixed(2)}% (Shadow Scan optimal)`
+        );
+      } else if (holdersScore === SCORING.HOLDERS_GOOD) {
+        reasons.push(
+          `✅ Bonne distribution: Top 10 détient ${top10Percentage.toFixed(2)}% (Shadow Scan acceptable)`
+        );
+      }
+    } else if (holdersScore === SCORING.HOLDERS_NEUTRAL) {
       reasons.push(
-        `🚨 CRITIQUE: Un wallet détient ${riskyHolder?.percentage.toFixed(2)}% (risque de dump massif)`
-      );
-    } else if (holdersScore === -HOLDERS_TOP10_PENALTY) {
-      reasons.push(
-        `🚨 Pénalité: Top 10 détient ${top10Percentage.toFixed(2)}% (concentration trop élevée)`
-      );
-    } else if (holdersScore === SCORING.HOLDERS_EXCELLENT) {
-      reasons.push(
-        `✅ Excellente distribution: Top 10 détient ${top10Percentage.toFixed(2)}% (Shadow Scan optimal)`
-      );
-    } else if (holdersScore === SCORING.HOLDERS_GOOD) {
-      reasons.push(
-        `✅ Bonne distribution: Top 10 détient ${top10Percentage.toFixed(2)}% (Shadow Scan acceptable)`
+        `📊 Distribution neutre (pas de holders au Block 0 - normal)`
       );
     }
   }
 
   totalScore += holdersScore;
+
+  // Fresh Mint Bonus : Si bonding curve < 2% ET métadonnées existent, +20 pts
+  // Note : Ce bonus ne sert à rien si la règle "No Social" s'active (voir ci-dessous)
+  let freshMintBonus = 0;
+  if (progress < 2 && token.metadata && (token.metadata.name || token.metadata.symbol)) {
+    freshMintBonus = SCORING.FRESH_MINT_BONUS;
+    totalScore += freshMintBonus;
+    reasons.push(`🚀 Bonus Fresh Mint (bonding curve < 2% avec métadonnées)`);
+  }
 
   // Calcul du score préliminaire (avant analyse IA)
   const preliminaryScore = totalScore;
@@ -547,7 +667,43 @@ export async function validateToken(
   // Appliquer la modification du score IA
   totalScore += aiScoreModifier;
 
-  // Calcul du Market Cap
+  // RÈGLE "NO SOCIAL, NO PARTY" (Plafond de verre) - MODE "SNIPER ÉLITE"
+  // C'est la règle la plus importante : À la toute fin du calcul
+  // Si score social = 0 (aucun lien Twitter/TG/Web valide), forcer le score à maximum 30
+  // Cela empêchera mécaniquement tout token sans projet de déclencher une alerte
+  if (socialScore === 0) {
+    const maxScoreWithoutSocial = 30;
+    if (totalScore > maxScoreWithoutSocial) {
+      totalScore = maxScoreWithoutSocial;
+      reasons.push(`⛔ Rejeté: Aucun social (Sniper Mode)`);
+    }
+  }
+
+  // RÈGLE ADDITIONNELLE "TWITTER SEUL INSUFFISANT" - MODE "SNIPER ÉLITE"
+  // Si seulement Twitter (20pts) sans Telegram ni Website, plafonner à 50 maximum
+  // Pour déclencher une alerte, il faut au moins Twitter + Telegram OU Twitter + Website
+  const social = token.metadata?.social;
+  const hasTwitter = social?.twitter && isValidTwitterLink(social.twitter);
+  const hasTelegram = social?.telegram && isValidTelegramLink(social.telegram);
+  const hasWebsite = social?.website && (() => {
+    try {
+      const url = new URL(social.website);
+      return url.protocol === 'http:' || url.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  })();
+
+  // Si seulement Twitter (sans Telegram ni Website), plafonner à 50
+  if (hasTwitter && !hasTelegram && !hasWebsite && socialScore === SCORING.SOCIAL_TWITTER) {
+    const maxScoreTwitterOnly = 50;
+    if (totalScore > maxScoreTwitterOnly) {
+      totalScore = maxScoreTwitterOnly;
+      reasons.push(`⛔ Rejeté: Twitter seul insuffisant (Sniper Mode - Telegram ou Website requis)`);
+    }
+  }
+
+  // Calcul du Market Cap (gère proprement les cas où les données manquent)
   const marketCap = calculateMarketCap(token.reserves, solPriceUsd);
 
   // Détermination si c'est une Alerte Alpha

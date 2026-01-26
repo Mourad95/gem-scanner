@@ -29,7 +29,53 @@ cp .env.example .env
 
 ## Utilisation
 
+### Option 1 : Avec Makefile (Recommandé)
+
+Le Makefile simplifie toutes les opérations :
+
 ```bash
+# Afficher toutes les commandes disponibles
+make help
+
+# Démarrage rapide avec Docker
+make run-docker
+
+# Démarrage rapide sans Docker (local)
+make run
+
+# Commandes Docker
+make docker-up          # Démarrer avec Docker
+make docker-down        # Arrêter Docker
+make docker-logs        # Voir les logs
+make docker-ps          # Statut des services
+
+# Commandes locales
+make dev                # Mode développement
+make build              # Compiler
+make test               # Tests
+```
+
+### Option 2 : Docker manuel
+
+```bash
+# Démarrage rapide
+./docker-start.sh
+
+# Ou manuellement
+docker-compose up -d
+
+# Voir les logs
+docker-compose logs -f
+```
+
+📖 Voir [README.DOCKER.md](./README.DOCKER.md) pour la documentation complète Docker.
+
+### Option 3 : Installation locale
+
+```bash
+# Installation
+npm install
+
 # Mode développement (avec watch)
 npm run dev
 
@@ -41,6 +87,12 @@ npm run build
 
 # Vérification des types
 npm run type-check
+```
+
+**Note** : Pour l'analyse IA, vous devez avoir Ollama installé localement avec le modèle `qwen2.5:0.5b` :
+```bash
+ollama pull qwen2.5:0.5b
+ollama serve
 ```
 
 ## Performance

@@ -14,6 +14,7 @@
 
 ---
 
+<a id="vue-densemble"></a>
 ## 🎯 Vue d'ensemble
 
 Le **Gem Scanner** est un système de surveillance en temps réel des tokens Solana créés sur pump.fun. Il analyse automatiquement chaque nouveau token et envoie des alertes Telegram pour les opportunités Alpha (score > 70).
@@ -29,6 +30,7 @@ Le **Gem Scanner** est un système de surveillance en temps réel des tokens Sol
 
 ---
 
+<a id="architecture-globale"></a>
 ## 🏗️ Architecture globale
 
 ```
@@ -117,6 +119,7 @@ Le **Gem Scanner** est un système de surveillance en temps réel des tokens Sol
 
 ---
 
+<a id="flux-de-données-détaillé"></a>
 ## 🔄 Flux de données détaillé
 
 ### Étape 1 : Détection du token
@@ -285,6 +288,7 @@ Si condition remplie :
 
 ---
 
+<a id="services-et-responsabilités"></a>
 ## 🛠️ Services et responsabilités
 
 ### `solanaMonitor.ts`
@@ -343,6 +347,7 @@ Si condition remplie :
 
 ---
 
+<a id="système-de-scoring"></a>
 ## 📊 Système de scoring
 
 ### Répartition des points
@@ -383,6 +388,7 @@ Si condition remplie :
 
 ---
 
+<a id="intégration-ia-ollama"></a>
 ## 🤖 Intégration IA (Ollama)
 
 ### Configuration
@@ -430,6 +436,7 @@ L'IA est appelée **UNIQUEMENT** si :
 
 ---
 
+<a id="conditions-dalerte"></a>
 ## 🚨 Conditions d'alerte
 
 ### Alerte Alpha
@@ -454,6 +461,7 @@ L'IA est appelée **UNIQUEMENT** si :
 
 ---
 
+<a id="gestion-des-erreurs"></a>
 ## ⚠️ Gestion des erreurs
 
 ### Timeouts
@@ -479,6 +487,7 @@ L'IA est appelée **UNIQUEMENT** si :
 
 ---
 
+<a id="performance-et-optimisations"></a>
 ## ⚡ Performance et optimisations
 
 ### Optimisations implémentées

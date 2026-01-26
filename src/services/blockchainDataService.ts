@@ -8,6 +8,7 @@ import axios from 'axios';
 import { Connection, PublicKey } from '@solana/web3.js';
 import type { TokenData } from './analyzer.js';
 import type { SolanaConfig } from '../config/settings.js';
+import { rpcRateLimiter } from './rateLimiter.js';
 
 /**
  * Constantes des Programmes
@@ -34,16 +35,30 @@ function createConnection(solana: SolanaConfig): Connection {
     fetchHeaders['Authorization'] = `Bearer ${solana.rpcKey}`;
   }
 
-  // Créer la connexion avec les headers personnalisés
+  // Créer la connexion avec les headers personnalisés et rate limiting
   return new Connection(solana.rpcUrl, {
     commitment: 'confirmed',
-    fetch: (url, options) => {
+    fetch: async (url, options) => {
+      // Appliquer le rate limiting avant chaque requête RPC
+      await rpcRateLimiter.execute(async () => {
+        return Promise.resolve();
+      });
+
       // Fusionner les headers personnalisés avec ceux de la requête
       const mergedHeaders = {
         ...options?.headers,
         ...fetchHeaders,
       };
-      return fetch(url, { ...options, headers: mergedHeaders });
+      
+      // Faire la requête
+      const response = await fetch(url, { ...options, headers: mergedHeaders });
+      
+      // Si erreur 429, appliquer le backoff
+      if (response.status === 429) {
+        rpcRateLimiter.backoff();
+      }
+      
+      return response;
     },
   });
 }
@@ -104,13 +119,15 @@ async function fetchMetadataOnce(
     const connection = createConnection(solana);
     const publicKey = new PublicKey(metadataAccount);
     
-    // Utiliser getAccountInfo - retourne directement un Buffer
-    const accountInfo = await Promise.race([
-      connection.getAccountInfo(publicKey),
-      new Promise<null>((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout')), 2000)
-      ),
-    ]) as { data: Buffer } | null;
+    // Utiliser getAccountInfo avec rate limiting pour éviter les 429
+    const accountInfo = await rpcRateLimiter.execute(async () => {
+      return await Promise.race([
+        connection.getAccountInfo(publicKey),
+        new Promise<null>((_, reject) => 
+          setTimeout(() => reject(new Error('Timeout')), 2000)
+        ),
+      ]) as { data: Buffer } | null;
+    });
 
     if (!accountInfo || !accountInfo.data) {
       console.log(`   ⚠️  Compte Metaplex non trouvé ou vide: ${metadataAccount.substring(0, 16)}...`);
@@ -214,12 +231,15 @@ async function fetchToken2022Metadata(
     const connection = createConnection(solana);
     const mintPublicKey = new PublicKey(mintAddress);
     
-    const accountInfo = await Promise.race([
-      connection.getAccountInfo(mintPublicKey),
-      new Promise<null>((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout')), 2000)
-      ),
-    ]) as { data: Buffer; owner: PublicKey } | null;
+    // Utiliser rate limiting pour éviter les 429
+    const accountInfo = await rpcRateLimiter.execute(async () => {
+      return await Promise.race([
+        connection.getAccountInfo(mintPublicKey),
+        new Promise<null>((_, reject) => 
+          setTimeout(() => reject(new Error('Timeout')), 2000)
+        ),
+      ]) as { data: Buffer; owner: PublicKey } | null;
+    });
 
     if (!accountInfo || !accountInfo.data) {
       return null;
@@ -473,8 +493,9 @@ async function fetchMetaplexMetadataWithRetry(
 /**
  * Récupère les réserves réelles de la Bonding Curve
  * Utilise Connection de @solana/web3.js
+ * @export pour utilisation dans solanaMonitor.ts
  */
-async function fetchBondingCurveReserves(
+export async function fetchBondingCurveReserves(
   mintAddress: string,
   solana: SolanaConfig
 ): Promise<{ vSolReserves: number; tokenReserves: number } | null> {
@@ -485,13 +506,15 @@ async function fetchBondingCurveReserves(
     const connection = createConnection(solana);
     const publicKey = new PublicKey(curveAddress);
     
-    // Utiliser getAccountInfo - retourne directement un Buffer
-    const accountInfo = await Promise.race([
-      connection.getAccountInfo(publicKey),
-      new Promise<null>((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout')), 2000)
-      ),
-    ]) as { data: Buffer } | null;
+    // Utiliser getAccountInfo avec rate limiting
+    const accountInfo = await rpcRateLimiter.execute(async () => {
+      return await Promise.race([
+        connection.getAccountInfo(publicKey),
+        new Promise<null>((_, reject) => 
+          setTimeout(() => reject(new Error('Timeout')), 2000)
+        ),
+      ]) as { data: Buffer } | null;
+    });
 
     if (!accountInfo || !accountInfo.data) return null;
 
@@ -507,10 +530,10 @@ async function fetchBondingCurveReserves(
     };
 
   } catch (error) {
-    return {
-      vSolReserves: 30,
-      tokenReserves: 1_000_000_000
-    };
+    // Ne pas retourner de valeurs par défaut qui faussent le calcul
+    // Si les réserves ne sont pas disponibles, retourner null
+    // Le calculateMarketCap retournera 0 si reserves est null/undefined
+    return null;
   }
 }
 

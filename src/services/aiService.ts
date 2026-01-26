@@ -7,8 +7,11 @@ import axios from 'axios';
 
 /**
  * Configuration de l'API Ollama
+ * L'URL peut être configurée via la variable d'environnement OLLAMA_API_URL
+ * Par défaut: http://localhost:11434/api/generate (pour développement local)
+ * En Docker: http://ollama:11434/api/generate (via docker-compose)
  */
-const OLLAMA_API_URL = 'http://localhost:11434/api/generate';
+const OLLAMA_API_URL = process.env['OLLAMA_API_URL'] || 'http://localhost:11434/api/generate';
 const OLLAMA_MODEL = 'qwen2.5:0.5b';
 const OLLAMA_TIMEOUT = 3000; // 3 secondes - timeout pour permettre au modèle de répondre
 const OLLAMA_TEMPERATURE = 0.1; // Pour des réponses déterministes et rapides

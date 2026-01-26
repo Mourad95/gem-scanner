@@ -1,0 +1,68 @@
+services:
+  # Service Ollama pour l'analyse IA
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    container_name: gem-scanner-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persister les modèles entre les redémarrages
+      - ollama-models:/root/.ollama/models
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s  # Plus de temps pour le téléchargement initial du modèle (3 minutes)
+    networks:
+      - gem-scanner-network
+    # Configuration des logs : rotation automatique (Ollama peut être verbeux)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"      # Taille max par fichier de log
+        max-file: "2"        # Nombre max de fichiers (total ~20MB, moins que scanner car plus verbeux)
+        compress: "true"     # Compression des anciens logs
+
+  # Service principal du scanner
+  scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gem-scanner-app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # Configuration Solana
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL}
+      - SOLANA_RPC_KEY=${SOLANA_RPC_KEY}
+      # Configuration Telegram
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # Configuration Ollama (pointant vers le service Docker)
+      - OLLAMA_API_URL=http://ollama:11434/api/generate
+    restart: unless-stopped
+    networks:
+      - gem-scanner-network
+    # Configuration des logs : rotation automatique
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"      # Taille max par fichier de log
+        max-file: "3"        # Nombre max de fichiers (total ~30MB)
+        compress: "true"     # Compression des anciens logs
+
+volumes:
+  ollama-models:
+    driver: local
+
+networks:
+  gem-scanner-network:
+    driver: bridge
+

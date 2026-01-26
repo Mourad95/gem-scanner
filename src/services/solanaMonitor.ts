@@ -1,5 +1,6 @@
 /**
  * Service pour surveiller les nouveaux tokens pump.fun via Solana RPC WebSocket
+ * VERSION OPTIMISÉE "ANTI-429" : Évite les appels inutiles
  * @module services/solanaMonitor
  */
 
@@ -7,16 +8,11 @@ import WebSocket from 'ws';
 import axios from 'axios';
 import type { TokenData } from './analyzer.js';
 import type { SolanaConfig } from '../config/settings.js';
-import { fetchTokenDataFromBlockchain } from './blockchainDataService.js';
-// 👇 CORRECTION ICI : On importe le bon service optimisé
+import { fetchTokenDataFromBlockchain, fetchBondingCurveReserves } from './blockchainDataService.js';
+import { rpcRateLimiter } from './rateLimiter.js';
 
 const PUMP_FUN_BONDING_CURVE = '6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23';
 const MAYHEM_PROGRAM_ID = 'MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e';
-
-/**
- * Petit utilitaire pour laisser le temps au RPC de respirer
- */
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 interface ParsedInstruction {
   program: string;
@@ -172,35 +168,39 @@ export class SolanaMonitor {
 
     if (msg['method'] === 'logsNotification') {
       const params = msg['params'] as Record<string, unknown>;
-      const result = params['result'] as Record<string, unknown>;
-      const value = result['value'] as Record<string, unknown>;
-      const signature = value['signature'] as string;
-      const logs = value['logs'] as string[];
+      const value = params['result'] as Record<string, unknown> | undefined;
+      const resultValue = value?.['value'] as Record<string, unknown> | undefined;
+      
+      if (resultValue) {
+        const signature = resultValue['signature'] as string;
+        const logs = resultValue['logs'] as string[];
 
-      if (signature && !this.processedSignatures.has(signature)) {
-        this.processedSignatures.add(signature);
-        this.processLogs(signature, logs);
+        if (signature && !this.processedSignatures.has(signature)) {
+          this.processedSignatures.add(signature);
+          // Nettoyer le cache périodiquement pour éviter les fuites mémoire
+          if (this.processedSignatures.size > 10000) {
+            this.processedSignatures.clear();
+          }
+          
+          this.processLogs(signature, logs);
+        }
       }
     }
   }
 
   private async processLogs(signature: string, logs: string[]): Promise<void> {
-    const tokenCreationPatterns = [
-      /Program.*invoke.*create/i,
-      /Program.*invoke.*create_v2/i,
-      /Program log:.*create/i,
-    ];
-    
-    const hasTokenCreation = logs.some((log) => 
-      tokenCreationPatterns.some((pattern) => pattern.test(log))
+    const isCreation = logs.some(log => 
+      log.includes('Program log: Instruction: Create') || 
+      log.includes('Program 6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23 invoke') ||
+      /Program.*invoke.*create/i.test(log) ||
+      /Program.*invoke.*create_v2/i.test(log)
     );
 
-    if (!hasTokenCreation) return;
+    if (!isCreation) return;
 
     console.log(`\n🎯 CRÉATION DE TOKEN DÉTECTÉE dans les logs !`);
     console.log(`   Signature: ${signature.substring(0, 16)}...`);
 
-    // Ajout à la file d'attente
     this.pendingTransactions.set(signature, {
       signature,
       logs,
@@ -211,46 +211,36 @@ export class SolanaMonitor {
     if (!this.processingInterval) {
       this.startProcessingQueue();
     }
-
-    // Attendre 1 seconde avant la première tentative
-    // Les transactions sont souvent disponibles après 1-2 secondes
-    await sleep(1000);
-    
-    // Traitement immédiat
-    await this.processPendingTransaction(signature);
   }
 
   private startProcessingQueue(): void {
     this.processingInterval = setInterval(() => {
       this.processPendingTransactions();
-    }, 2000);
+    }, 1000); // 1 tick par seconde pour lisser la charge
   }
 
   private async processPendingTransactions(): Promise<void> {
     const now = Date.now();
-    const signaturesToRetry: string[] = [];
-    
+    let processedCount = 0; // Compteur pour limiter à 3 par tick
+
     for (const [signature, pending] of this.pendingTransactions.entries()) {
-      // Supprimer les transactions trop anciennes (30 secondes)
-      if (now - pending.firstSeen > 30000) {
-        console.log(`   ⏰ Transaction ${signature.substring(0, 16)}... expirée après 30s`);
+      // Queue Throttling : Max 3 transactions par tick
+      if (processedCount >= 3) break;
+
+      // Supprimer les transactions trop anciennes (45 secondes)
+      if (now - pending.firstSeen > 45000) {
         this.pendingTransactions.delete(signature);
         continue;
       }
       
-      // Retry si le délai est passé (délai progressif)
-      const timeSinceFirstSeen = now - pending.firstSeen;
-      const expectedDelay = Math.min(pending.attempts * 1000, 5000);
-      
-      // Si on a attendu assez longtemps depuis la dernière tentative
-      if (timeSinceFirstSeen >= expectedDelay && pending.attempts < 5) {
-        signaturesToRetry.push(signature);
+      // Supprimer après 8 tentatives
+      if (pending.attempts >= 8) {
+        this.pendingTransactions.delete(signature);
+        continue;
       }
-    }
-    
-    // Traiter les retries
-    for (const signature of signaturesToRetry) {
+
       await this.processPendingTransaction(signature);
+      processedCount++;
     }
   }
 
@@ -258,25 +248,22 @@ export class SolanaMonitor {
     const pending = this.pendingTransactions.get(signature);
     if (!pending) return;
 
-    // Délai progressif : 1s, 2s, 3s, 4s, 5s
-    const delay = Math.min(pending.attempts * 1000, 5000);
-    if (pending.attempts > 0) {
-      await sleep(delay);
+    pending.attempts++;
+    
+    // Backoff Intelligent : attendre attempt * 1000ms avant de réessayer
+    if (pending.attempts > 1) {
+      const backoff = pending.attempts * 1000;
+      const timeSinceFirstSeen = Date.now() - pending.firstSeen;
+      if (timeSinceFirstSeen < backoff) {
+        return; // Pas encore le moment de réessayer
+      }
     }
 
-    pending.attempts++;
-
     try {
-      console.log(`   🔍 Récupération de la transaction (tentative ${pending.attempts})...`);
       const transaction = await this.getTransaction(signature);
+      
       if (!transaction) {
-        if (pending.attempts < 5) {
-          const nextDelay = Math.min((pending.attempts + 1) * 1000, 5000);
-          console.log(`   ⚠️  Transaction non disponible, retry dans ${nextDelay}ms...`);
-        } else {
-          console.log(`   ❌ Transaction non récupérée après ${pending.attempts} tentatives`);
-        }
-        return;
+        return; // Réessayera au prochain tick
       }
 
       if (transaction.meta?.err) {
@@ -287,46 +274,55 @@ export class SolanaMonitor {
 
       console.log(`   ✅ Transaction récupérée (slot: ${transaction.slot})`);
 
-      const tokenData = this.extractTokenData(transaction);
+      const tokenData = await this.extractTokenData(transaction);
+      
       if (tokenData && tokenData.address) {
         console.log(`   ✅ Mint address trouvé: ${tokenData.address}`);
         
-        // Essayer d'extraire les métadonnées directement depuis la transaction
-        const transactionMetadata = this.extractMetadataFromTransaction(transaction);
-        if (transactionMetadata && (transactionMetadata.name || transactionMetadata.symbol)) {
-          console.log(`   ✅ Métadonnées trouvées dans la transaction: ${transactionMetadata.name || 'N/A'}, ${transactionMetadata.symbol || 'N/A'}`);
-          // Utiliser directement les métadonnées de la transaction !
-          tokenData.metadata = transactionMetadata;
-        }
-        
-        // Si on a déjà les métadonnées de la transaction, on peut enrichir avec la blockchain pour les réserves
-        // Sinon, on attend un peu pour laisser le temps aux métadonnées d'être créées
-        if (!transactionMetadata || !transactionMetadata.name) {
-          const delay = Math.min(2000 + (pending.attempts * 500), 5000);
-          console.log(`   ⏳ Attente ${delay}ms pour laisser le temps aux métadonnées d'être créées...`);
-          await sleep(delay);
-        }
-
-        console.log(`   🔍 Enrichissement des métadonnées...`);
-        const enrichedTokenData = await this.enrichTokenData(tokenData.address);
-        
-        // Fusionner : utiliser les métadonnées de la transaction si disponibles, sinon celles de la blockchain
-        const finalTokenData: TokenData = {
-          ...tokenData,
-          ...enrichedTokenData,
-          // Priorité aux métadonnées de la transaction si disponibles
-          metadata: transactionMetadata && (transactionMetadata.name || transactionMetadata.symbol)
-            ? { ...enrichedTokenData?.metadata, ...transactionMetadata }
-            : enrichedTokenData?.metadata || tokenData.metadata,
-        };
-        
-        // Log pour confirmer que les métadonnées sont bien utilisées
-        if (finalTokenData.metadata?.name || finalTokenData.metadata?.symbol) {
-          console.log(`   ✅ Métadonnées finales: ${finalTokenData.metadata.name || 'N/A'}, ${finalTokenData.metadata.symbol || 'N/A'}`);
-        }
-        
-        if (this.onNewTokenCallback) {
-          this.onNewTokenCallback(finalTokenData);
+        // FAST-PATH: Si métadonnées trouvées dans les logs, on skip l'enrichissement des métadonnées
+        // MAIS on récupère toujours les réserves depuis la blockchain (nécessaire pour Market Cap et Bonding Curve)
+        if (tokenData.metadata?.name && tokenData.metadata?.name !== 'Unknown') {
+          console.log(`   ✅ Métadonnées trouvées dans les logs: ${tokenData.metadata.name}, ${tokenData.metadata.symbol || 'N/A'}`);
+          
+          // Récupérer les réserves depuis la blockchain (nécessaire pour Market Cap et Bonding Curve)
+          console.log(`   🔗 Récupération des réserves depuis la blockchain...`);
+          const reserves = await fetchBondingCurveReserves(
+            tokenData.address,
+            { rpcUrl: this.rpcUrl, rpcKey: this.rpcKey }
+          );
+          
+          if (reserves) {
+            tokenData.reserves = reserves;
+            console.log(`   ✅ Réserves récupérées: ${reserves.vSolReserves.toFixed(2)} SOL, ${reserves.tokenReserves.toFixed(0)} tokens`);
+          } else {
+            console.log(`   ⚠️  Réserves non disponibles (bonding curve peut-être pas encore créée)`);
+          }
+          
+          if (this.onNewTokenCallback) {
+            this.onNewTokenCallback(tokenData);
+          }
+        } else {
+          // SLOW-PATH: Appel RPC complet (métadonnées + réserves)
+          console.log(`   🔍 Enrichissement complet (métadonnées + réserves)...`);
+          const enrichedTokenData = await this.enrichTokenData(tokenData.address);
+          const finalTokenData: TokenData = {
+            ...tokenData,
+            ...enrichedTokenData,
+            metadata: enrichedTokenData?.metadata || tokenData.metadata,
+            reserves: enrichedTokenData?.reserves || tokenData.reserves,
+          };
+          
+          if (finalTokenData.metadata?.name || finalTokenData.metadata?.symbol) {
+            console.log(`   ✅ Métadonnées finales: ${finalTokenData.metadata.name || 'N/A'}, ${finalTokenData.metadata.symbol || 'N/A'}`);
+          }
+          
+          if (finalTokenData.reserves) {
+            console.log(`   ✅ Réserves finales: ${finalTokenData.reserves.vSolReserves.toFixed(2)} SOL, ${finalTokenData.reserves.tokenReserves.toFixed(0)} tokens`);
+          }
+          
+          if (this.onNewTokenCallback) {
+            this.onNewTokenCallback(finalTokenData);
+          }
         }
 
         this.pendingTransactions.delete(signature);
@@ -334,33 +330,32 @@ export class SolanaMonitor {
         console.log(`   ⚠️  Mint address non trouvé dans la transaction`);
       }
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : 'Erreur inconnue';
-      if (pending.attempts >= 5) {
-        console.log(`   ❌ Échec après ${pending.attempts} tentatives: ${errorMsg.substring(0, 100)}`);
-        this.pendingTransactions.delete(signature);
-      }
+      // Silent fail - réessayera au prochain tick
     }
   }
 
   private async getTransaction(signature: string): Promise<SolanaTransaction | null> {
     try {
-      const response = await axios.post(
-        this.rpcUrl,
-        {
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTransaction',
-          params: [
-            signature,
-            { 
-              encoding: 'jsonParsed', 
-              maxSupportedTransactionVersion: 0,
-              commitment: 'confirmed',
-            },
-          ],
-        },
-        { headers: this.prepareRpcHeaders(), timeout: 8000 }
-      );
+      // Utiliser rate limiting pour éviter les erreurs 429
+      const response = await rpcRateLimiter.execute(async () => {
+        return await axios.post(
+          this.rpcUrl,
+          {
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTransaction',
+            params: [
+              signature,
+              { 
+                encoding: 'jsonParsed', 
+                maxSupportedTransactionVersion: 0,
+                commitment: 'confirmed',
+              },
+            ],
+          },
+          { headers: this.prepareRpcHeaders(), timeout: 5000 }
+        );
+      });
 
       const result = response.data?.result as SolanaTransaction | null;
       
@@ -370,167 +365,254 @@ export class SolanaMonitor {
         // Ne pas logger les erreurs -32602 (Invalid params) ou -32004 (Transaction not found)
         // car c'est normal si la transaction est trop récente
         if (error.code !== -32602 && error.code !== -32004) {
-          console.log(`   ⚠️  Erreur RPC: ${error.message || 'Erreur inconnue'}`);
+          // Silent - évite le spam
         }
       }
       
       return result;
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : 'Erreur inconnue';
-      // Ne pas logger les timeouts ou erreurs réseau, c'est normal si la transaction est récente
-      if (!errorMsg.includes('timeout') && !errorMsg.includes('ECONNREFUSED')) {
-        console.log(`   ⚠️  Erreur lors de la récupération: ${errorMsg.substring(0, 100)}`);
+      // Gérer les erreurs 429 avec backoff
+      if (axios.isAxiosError(error) && error.response?.status === 429) {
+        rpcRateLimiter.backoff();
+        // Silent - évite le spam dans les logs
       }
       return null;
     }
   }
 
   /**
-   * Extrait les métadonnées (name, symbol) directement depuis la transaction
-   * Les instructions pump.fun peuvent contenir les métadonnées dans les données
+   * Récupère les métadonnées off-chain (image + réseaux sociaux) depuis l'URI
+   * @param uri - URI des métadonnées (peut être IPFS ou HTTP)
+   * @returns Objet avec image et social (twitter, telegram, website)
    */
-  private extractMetadataFromTransaction(transaction: SolanaTransaction): { name?: string; symbol?: string } | null {
+  private async fetchOffChainMetadata(uri: string): Promise<{
+    image?: string;
+    social?: { twitter?: string; telegram?: string; website?: string };
+  }> {
     try {
-      // Chercher dans les instructions pour des données de métadonnées
-      const instructions = [
-        ...transaction.transaction.message.instructions,
-        ...(transaction.meta.innerInstructions?.flatMap(inner => inner.instructions) || []),
-      ];
-
-      for (const inst of instructions) {
-        // Si l'instruction a des données parsées, chercher name/symbol
-        if (inst.parsed?.info) {
-          const info = inst.parsed.info as Record<string, unknown>;
-          const name = info['name'] as string | undefined;
-          const symbol = info['symbol'] as string | undefined;
-          
-          if (name || symbol) {
-            return { name, symbol };
-          }
-        }
-        
-        // Les métadonnées sont généralement dans les comptes, pas dans les données brutes
-        // On se concentre sur les instructions parsées
+      // Gérer les liens IPFS : ipfs:// -> https://ipfs.io/ipfs/
+      let jsonUrl = uri.trim();
+      if (jsonUrl.startsWith('ipfs://')) {
+        jsonUrl = jsonUrl.replace('ipfs://', 'https://ipfs.io/ipfs/');
+      } else if (jsonUrl.startsWith('ipfs/')) {
+        jsonUrl = `https://ipfs.io/${jsonUrl}`;
       }
+
+      // Requête GET avec timeout court pour ne pas ralentir le bot
+      const response = await axios.get(jsonUrl, {
+        timeout: 1500,
+        headers: {
+          'Accept': 'application/json',
+        },
+      });
+
+      const json = response.data as Record<string, unknown>;
+
+      // Structure pump.fun : les réseaux sociaux peuvent être à la racine ou dans extensions
+      const social: { twitter?: string; telegram?: string; website?: string } = {};
+
+      // Chercher Twitter (plusieurs variantes possibles)
+      const twitter = 
+        json['twitter'] as string | undefined ||
+        json['Twitter'] as string | undefined ||
+        (json['extensions'] as Record<string, unknown> | undefined)?.['twitter'] as string | undefined ||
+        (json['extensions'] as Record<string, unknown> | undefined)?.['Twitter'] as string | undefined;
       
-      return null;
+      if (twitter) {
+        // Nettoyer l'URL Twitter (enlever @ si présent, ajouter https:// si absent)
+        let twitterUrl = String(twitter).trim();
+        if (twitterUrl.startsWith('@')) {
+          twitterUrl = twitterUrl.substring(1);
+        }
+        if (twitterUrl && !twitterUrl.startsWith('http')) {
+          twitterUrl = `https://twitter.com/${twitterUrl}`;
+        }
+        if (twitterUrl) social.twitter = twitterUrl;
+      }
+
+      // Chercher Telegram
+      const telegram = 
+        json['telegram'] as string | undefined ||
+        json['Telegram'] as string | undefined ||
+        (json['extensions'] as Record<string, unknown> | undefined)?.['telegram'] as string | undefined ||
+        (json['extensions'] as Record<string, unknown> | undefined)?.['Telegram'] as string | undefined;
+      
+      if (telegram) {
+        let telegramUrl = String(telegram).trim();
+        if (telegramUrl && !telegramUrl.startsWith('http')) {
+          telegramUrl = `https://t.me/${telegramUrl.replace('@', '')}`;
+        }
+        if (telegramUrl) social.telegram = telegramUrl;
+      }
+
+      // Chercher Website
+      const website = 
+        json['website'] as string | undefined ||
+        json['Website'] as string | undefined ||
+        json['homepage'] as string | undefined ||
+        (json['extensions'] as Record<string, unknown> | undefined)?.['website'] as string | undefined;
+      
+      if (website) {
+        let websiteUrl = String(website).trim();
+        if (websiteUrl && !websiteUrl.startsWith('http')) {
+          websiteUrl = `https://${websiteUrl}`;
+        }
+        if (websiteUrl) social.website = websiteUrl;
+      }
+
+      // Chercher l'image
+      const image = 
+        json['image'] as string | undefined ||
+        json['Image'] as string | undefined ||
+        json['imageUrl'] as string | undefined;
+
+      // Gérer les images IPFS aussi
+      let imageUrl: string | undefined = undefined;
+      if (image) {
+        imageUrl = String(image).trim();
+        if (imageUrl.startsWith('ipfs://')) {
+          imageUrl = imageUrl.replace('ipfs://', 'https://ipfs.io/ipfs/');
+        }
+      }
+
+      return {
+        ...(imageUrl ? { image: imageUrl } : {}),
+        ...(Object.keys(social).length > 0 ? { social } : {}),
+      };
     } catch (error) {
-      return null;
+      // Silent fail - si l'URI n'est pas accessible, on continue sans métadonnées off-chain
+      return {};
     }
   }
 
-  private extractTokenData(transaction: SolanaTransaction): TokenData | null {
+  private async extractTokenData(transaction: SolanaTransaction): Promise<TokenData | null> {
     try {
       let mintAddress: string | null = null;
+      let name: string | undefined = undefined;
+      let symbol: string | undefined = undefined;
+      let uri: string | undefined = undefined;
 
-      // Stratégie fiable pour Pump.fun : Regarder les postTokenBalances
-      // Le mint est le token qui a une balance post > 0 et pre = 0 (ou n'existait pas)
+      // Stratégie 1: postTokenBalances (le plus fiable)
       if (transaction.meta.postTokenBalances) {
         const newMint = transaction.meta.postTokenBalances.find(bal => 
-            // Souvent le mint a un decimal de 6 pour pump.fun
             bal.uiTokenAmount?.decimals === 6 && 
             bal.uiTokenAmount?.uiAmount !== null
         );
         if (newMint) mintAddress = newMint.mint;
       }
-
-      // Fallback : AccountKeys
-      // Le mint est souvent le compte index 1 ou 2 qui est writable et non-signer
+      
+      // Stratégie 2: AccountKeys (fallback)
       if (!mintAddress && transaction.transaction.message.accountKeys) {
          const accounts = transaction.transaction.message.accountKeys;
-         // Sur pump.fun create, le mint est souvent le 2ème ou 3ème compte
-         // Fix: Be sure mintAddress is a valid pubkey string and not a Program address.
-         for (let i = 0; i < Math.min(accounts.length, 4); i++) {
+         for (let i = 0; i < Math.min(accounts.length, 5); i++) {
              const acc = accounts[i];
-             // Exclude signers, require writable, and skip Sys/Token programs
-             if (
-               acc &&
-               !acc.signer &&
-               acc.writable &&
-               typeof acc.pubkey === 'string' &&
-               !acc.pubkey.startsWith('111111') && // Exclude System Program
-               !acc.pubkey.startsWith('TokenkegQ') // Exclude SPL Token
-             ) {
-                 mintAddress = acc.pubkey;
-                 break;
+             if (acc && !acc.signer && acc.writable && typeof acc.pubkey === 'string') {
+                 // Exclure les programmes système
+                 if (!acc.pubkey.startsWith('111111') && !acc.pubkey.startsWith('TokenkegQ')) {
+                   mintAddress = acc.pubkey;
+                   break;
+                 }
              }
          }
-         }
-      if (!mintAddress) {
-        return null;
+      }
+
+      if (!mintAddress) return null;
+
+      // FAST-PATH: Extraire name/symbol directement depuis les logs (évite l'appel RPC)
+      const logs = transaction.meta.logMessages || [];
+      for (const log of logs) {
+          // Chercher les patterns de métadonnées dans les logs
+          if (log.includes('name:') || log.includes('symbol:') || log.includes('Name:') || log.includes('Symbol:') || log.includes('uri:') || log.includes('URI:')) {
+              // Pattern 1: "name: X, symbol: Y, uri: Z"
+              const nameMatch = log.match(/name:\s*([^,\s}]+)/i) || log.match(/Name:\s*([^,\s}]+)/i);
+              const symbolMatch = log.match(/symbol:\s*([^,\s}]+)/i) || log.match(/Symbol:\s*([^,\s}]+)/i);
+              const uriMatch = log.match(/uri:\s*([^,\s}]+)/i) || log.match(/URI:\s*([^,\s}]+)/i);
+              
+              if (nameMatch && nameMatch[1]) name = nameMatch[1].trim().replace(/['"]/g, '');
+              if (symbolMatch && symbolMatch[1]) symbol = symbolMatch[1].trim().replace(/['"]/g, '');
+              if (uriMatch && uriMatch[1]) uri = uriMatch[1].trim().replace(/['"]/g, '');
+          }
+      }
+
+      // Chercher aussi dans les instructions parsées
+      if ((!name || !symbol) && transaction.transaction.message.instructions) {
+        for (const inst of transaction.transaction.message.instructions) {
+          if (inst?.parsed?.info) {
+            const info = inst.parsed.info as Record<string, unknown>;
+            if (!name && info['name']) name = String(info['name']);
+            if (!symbol && info['symbol']) symbol = String(info['symbol']);
+            if (!uri && info['uri']) uri = String(info['uri']);
+          }
+        }
+      }
+
+      // Chercher dans les innerInstructions aussi
+      if ((!name || !symbol || !uri) && transaction.meta.innerInstructions) {
+        for (const inner of transaction.meta.innerInstructions) {
+          if (inner?.instructions) {
+            for (const inst of inner.instructions) {
+              if (inst?.parsed?.info) {
+                const info = inst.parsed.info as Record<string, unknown>;
+                if (!name && info?.['name']) name = String(info['name']);
+                if (!symbol && info?.['symbol']) symbol = String(info['symbol']);
+                if (!uri && info?.['uri']) uri = String(info['uri']);
+              }
+            }
+          }
+        }
+      }
+
+      // Si on a trouvé une URI, récupérer immédiatement les métadonnées off-chain (réseaux sociaux)
+      let offChainMetadata: {
+        image?: string;
+        social?: { twitter?: string; telegram?: string; website?: string };
+      } = {};
+
+      if (uri) {
+        console.log(`   🔗 URI trouvée dans les logs, récupération des métadonnées off-chain...`);
+        offChainMetadata = await this.fetchOffChainMetadata(uri);
+        
+        if (offChainMetadata.social && Object.keys(offChainMetadata.social).length > 0) {
+          const socials = Object.keys(offChainMetadata.social).join(', ');
+          console.log(`   ✅ Réseaux sociaux trouvés: ${socials}`);
+        }
       }
 
       return {
         address: mintAddress,
-        reserves: { vSolReserves: 30, tokenReserves: 1_000_000_000 },
+        metadata: name || symbol ? {
+          name: name || 'Unknown',
+          symbol: symbol || 'Unknown',
+          ...(offChainMetadata.image ? { image: offChainMetadata.image } : {}),
+          ...(offChainMetadata.social && Object.keys(offChainMetadata.social).length > 0 
+            ? { social: offChainMetadata.social } 
+            : {}),
+        } : undefined,
+        // Ne pas mettre de réserves par défaut - elles seront récupérées depuis la blockchain
+        // Si les réserves ne sont pas disponibles, calculateMarketCap retournera 0
+        reserves: undefined,
       };
     } catch (error) {
       return null;
     }
   }
 
-  /**
-   * Enrichit les données : BLOCKCHAIN D'ABORD, API APRES
-   */
   private async enrichTokenData(mintAddress: string): Promise<TokenData | null> {
     try {
-      // 1. PRIORITÉ ABSOLUE : BLOCKCHAIN (Via le nouveau service optimisé)
-      // C'est ici que la magie opère.
+      // Utiliser le service optimisé blockchainDataService
       const blockchainData = await fetchTokenDataFromBlockchain(
         mintAddress,
         { rpcUrl: this.rpcUrl, rpcKey: this.rpcKey }
       );
-      // Log détaillé pour debug
-      if (!blockchainData || !blockchainData.metadata?.name) {
-        console.log(`   ⚠️  Aucune métadonnée récupérée depuis la blockchain`);
-      }
 
-      // Si la blockchain a trouvé le nom, ON GAGNE ! On retourne direct.
       if (blockchainData && blockchainData.metadata?.name) {
         return {
           address: mintAddress,
           ...blockchainData,
         } as TokenData;
       }
-
-      // 2. PLAN B (Désespoir) : API Pump.fun
-      // On n'arrive ici que si la blockchain a échoué (très rare avec le fix)
-      if (!blockchainData || !blockchainData.metadata?.name) {
-        console.log(`   ⚠️  Blockchain muette, tentative API pump.fun...`);
-      }
-      const apiUrls = [`https://frontend-api.pump.fun/coins/${mintAddress}`];
-
-      for (const url of apiUrls) {
-        try {
-          const response = await axios.get(url, {
-            timeout: 1000, 
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-          });
-          if (response.status === 200 && response.data.name) {
-             // Mapping API data...
-             return {
-                 address: mintAddress,
-                 metadata: {
-                     name: response.data.name,
-                     symbol: response.data.symbol,
-                     description: response.data.description,
-                     image: response.data.image,
-                     social: { 
-                         twitter: response.data.twitter, 
-                         telegram: response.data.telegram,
-                         website: response.data.website
-                     }
-                 },
-                 reserves: { vSolReserves: 30, tokenReserves: 1_000_000_000 }
-             };
-          }
-        } catch (e) { continue; }
-      }
-
-      // 3. ECHEC TOTAL : On renvoie quand même l'adresse pour l'analyser
-      // (Peut-être que l'analyzer arrivera à choper des infos via RugCheck plus tard)
-      return blockchainData ? { address: mintAddress, ...blockchainData } as TokenData : null;
-
+      
+      return null;
     } catch (error) {
       return null;
     }

@@ -1,0 +1,16 @@
+# Dockerfile pour Ollama avec modèle qwen2.5:0.5b
+FROM ollama/ollama:latest
+
+# Installer curl pour le healthcheck (l'image Ollama est basée sur Debian/Ubuntu)
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Exposer le port par défaut d'Ollama
+EXPOSE 11434
+
+# Script de démarrage qui télécharge le modèle si nécessaire
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["ollama", "serve"]
+

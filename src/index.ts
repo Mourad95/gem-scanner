@@ -290,7 +290,7 @@ class TokenScanner {
       });
 
       // Afficher le score détaillé
-      const scoreColor = analysis.score >= 70 ? chalk.green : analysis.score >= 50 ? chalk.yellow : chalk.red;
+      const scoreColor = analysis.score >= 55 ? chalk.green : analysis.score >= 50 ? chalk.yellow : chalk.red;
       console.log(scoreColor(`   📈 Score: ${analysis.score}/100`));
       console.log(chalk.gray(`      - Social: ${analysis.breakdown.socialScore}pts`));
       console.log(chalk.gray(`      - Bonding Curve: ${analysis.breakdown.bondingCurveScore}pts`));
@@ -331,7 +331,7 @@ class TokenScanner {
           console.error(chalk.red(`   ❌ Erreur envoi: ${error instanceof Error ? error.message : error}\n`));
         }
       } else {
-        console.log(chalk.yellow(`   ⚪ Pas d'alerte (score ${analysis.score} < 70)`));
+        console.log(chalk.yellow(`   ⚪ Pas d'alerte (score ${analysis.score} < 55)`));
         // Afficher les raisons du rejet pour debug
         if (analysis.reasons.length > 0) {
           console.log(chalk.gray(`      Raisons: ${analysis.reasons.slice(0, 3).join(', ')}`));

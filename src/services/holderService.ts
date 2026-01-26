@@ -6,6 +6,7 @@
 
 import axios from 'axios';
 import type { SolanaConfig } from '../config/settings.js';
+import { rpcRateLimiter } from './rateLimiter.js';
 
 /**
  * Prépare les headers pour une requête RPC Solana
@@ -75,20 +76,23 @@ async function fetchTokenSupply(
   signal?: AbortSignal
 ): Promise<number> {
   try {
-    const response = await axios.post(
-      solana.rpcUrl,
-      {
-        jsonrpc: '2.0',
-        id: 2,
-        method: 'getTokenSupply',
-        params: [tokenAddress],
-      },
-      {
-        headers: prepareRpcHeaders(solana),
-        timeout: 2000, // Timeout court pour la supply
-        signal, 
-      }
-    );
+    // Utiliser rate limiting pour éviter les erreurs 429
+    const response = await rpcRateLimiter.execute(async () => {
+      return await axios.post(
+        solana.rpcUrl,
+        {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'getTokenSupply',
+          params: [tokenAddress],
+        },
+        {
+          headers: prepareRpcHeaders(solana),
+          timeout: 2000, // Timeout court pour la supply
+          signal, 
+        }
+      );
+    });
 
     const supply = response.data?.result?.value?.uiAmount;
     return supply ?? PUMP_FUN_DEFAULT_SUPPLY;
@@ -117,22 +121,24 @@ export async function fetchTokenHolders(
   }
 
   try {
-    // 1. Lancement parallèle Supply + Top Accounts
+    // 1. Lancement parallèle Supply + Top Accounts avec rate limiting
     const [accountsResponse, totalSupply] = await Promise.all([
-      axios.post(
-        solana.rpcUrl,
-        {
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTokenLargestAccounts',
-          params: [tokenAddress],
-        },
-        {
-          headers: prepareRpcHeaders(solana),
-          timeout: 2500, // On laisse un peu plus de temps pour les comptes que pour la supply
-          signal, 
-        }
-      ),
+      rpcRateLimiter.execute(async () => {
+        return await axios.post(
+          solana.rpcUrl,
+          {
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTokenLargestAccounts',
+            params: [tokenAddress],
+          },
+          {
+            headers: prepareRpcHeaders(solana),
+            timeout: 2500,
+            signal, 
+          }
+        );
+      }),
       fetchTokenSupply(tokenAddress, solana, signal),
     ]);
 
@@ -168,6 +174,13 @@ export async function fetchTokenHolders(
 
     return holders;
   } catch (error) {
+    // Gérer les erreurs 429 avec backoff
+    if (axios.isAxiosError(error) && error.response?.status === 429) {
+      rpcRateLimiter.backoff(); // Réduire temporairement le taux
+      // Retourner un tableau vide pour ne pas bloquer le scanner
+      return [];
+    }
+    
     // Si c'est une annulation volontaire (timeout du scanner), on relance l'erreur
     if (axios.isCancel(error)) {
       throw error;
