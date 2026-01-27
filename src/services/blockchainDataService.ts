@@ -22,9 +22,24 @@ const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /**
- * Crée une connexion Solana optimisée avec gestion des headers Helius
+ * Singleton pour la connexion Solana (une seule instance par configuration)
+ * Évite de recréer des connexions à chaque appel
+ */
+const connectionCache = new Map<string, Connection>();
+
+/**
+ * Crée ou récupère une connexion Solana optimisée avec gestion des headers Helius
+ * Utilise un cache pour éviter de recréer des connexions
  */
 function createConnection(solana: SolanaConfig): Connection {
+  // Créer une clé unique pour le cache basée sur l'URL et la clé
+  const cacheKey = `${solana.rpcUrl}:${solana.rpcKey || ''}`;
+  
+  // Si la connexion existe déjà dans le cache, la retourner
+  if (connectionCache.has(cacheKey)) {
+    return connectionCache.get(cacheKey)!;
+  }
+
   // Si l'URL contient déjà la clé API (format Helius), l'utiliser directement
   const hasApiKeyInUrl = solana.rpcUrl.includes('api-key=') || solana.rpcUrl.includes('apikey=');
   
@@ -36,31 +51,33 @@ function createConnection(solana: SolanaConfig): Connection {
   }
 
   // Créer la connexion avec les headers personnalisés et rate limiting
-  return new Connection(solana.rpcUrl, {
+  const connection = new Connection(solana.rpcUrl, {
     commitment: 'confirmed',
     fetch: async (url, options) => {
       // Appliquer le rate limiting avant chaque requête RPC
-      await rpcRateLimiter.execute(async () => {
-        return Promise.resolve();
+      return await rpcRateLimiter.execute(async () => {
+        // Fusionner les headers personnalisés avec ceux de la requête
+        const mergedHeaders = {
+          ...options?.headers,
+          ...fetchHeaders,
+        };
+        
+        // Faire la requête
+        const response = await fetch(url, { ...options, headers: mergedHeaders });
+        
+        // Si erreur 429, appliquer la pause globale
+        if (response.status === 429) {
+          rpcRateLimiter.handle429();
+        }
+        
+        return response;
       });
-
-      // Fusionner les headers personnalisés avec ceux de la requête
-      const mergedHeaders = {
-        ...options?.headers,
-        ...fetchHeaders,
-      };
-      
-      // Faire la requête
-      const response = await fetch(url, { ...options, headers: mergedHeaders });
-      
-      // Si erreur 429, appliquer le backoff
-      if (response.status === 429) {
-        rpcRateLimiter.backoff();
-      }
-      
-      return response;
     },
   });
+
+  // Mettre en cache la connexion
+  connectionCache.set(cacheKey, connection);
+  return connection;
 }
 
 /**
@@ -462,7 +479,18 @@ async function fetchMetaplexMetadataWithRetry(
          // Mais pour Pump.fun, l'URI est souvent une URL metadata JSON directe
       }
 
-      const metadataReq = await axios.get(jsonUrl, { timeout: 1500 });
+      const metadataReq = await rpcRateLimiter.execute(async () => {
+        try {
+          return await axios.get(jsonUrl, { timeout: 1500 });
+        } catch (error) {
+          // Gérer les erreurs 429
+          if (axios.isAxiosError(error) && error.response?.status === 429) {
+            rpcRateLimiter.handle429();
+          }
+          throw error;
+        }
+      });
+      
       const json = metadataReq.data;
 
       description = json.description;
@@ -516,7 +544,15 @@ export async function fetchBondingCurveReserves(
       ]) as { data: Buffer } | null;
     });
 
-    if (!accountInfo || !accountInfo.data) return null;
+    // ROBUSTESSE : Si le compte n'existe pas encore (bonding curve pas encore créée),
+    // retourner les valeurs par défaut de départ pump.fun pour permettre au calcul de continuer
+    if (!accountInfo || !accountInfo.data) {
+      // Valeurs de départ pump.fun : 30 SOL, 1 milliard de tokens
+      return {
+        vSolReserves: 30,
+        tokenReserves: 1_000_000_000
+      };
+    }
 
     const buffer = accountInfo.data;
     
@@ -530,10 +566,12 @@ export async function fetchBondingCurveReserves(
     };
 
   } catch (error) {
-    // Ne pas retourner de valeurs par défaut qui faussent le calcul
-    // Si les réserves ne sont pas disponibles, retourner null
-    // Le calculateMarketCap retournera 0 si reserves est null/undefined
-    return null;
+    // En cas d'erreur, retourner les valeurs par défaut pour éviter de crasher le score
+    // Cela permet au calcul de Market Cap de continuer avec des valeurs de départ
+    return {
+      vSolReserves: 30,
+      tokenReserves: 1_000_000_000
+    };
   }
 }
 

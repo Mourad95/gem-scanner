@@ -8,7 +8,6 @@ import WebSocket from 'ws';
 import axios from 'axios';
 import type { TokenData } from './analyzer.js';
 import type { SolanaConfig } from '../config/settings.js';
-import { fetchTokenDataFromBlockchain, fetchBondingCurveReserves } from './blockchainDataService.js';
 import { rpcRateLimiter } from './rateLimiter.js';
 
 const PUMP_FUN_BONDING_CURVE = '6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23';
@@ -80,6 +79,7 @@ export class SolanaMonitor {
   private onNewTokenCallback: ((tokenData: TokenData) => void) | null = null;
   private pendingTransactions: Map<string, PendingTransaction> = new Map();
   private processingInterval: NodeJS.Timeout | null = null;
+  private lastQueueSaturatedLog: number = 0;
 
   constructor(solana: SolanaConfig) {
     this.rpcUrl = solana.rpcUrl;
@@ -189,6 +189,17 @@ export class SolanaMonitor {
   }
 
   private async processLogs(signature: string, logs: string[]): Promise<void> {
+    // Vérification de la file d'attente : si saturée (>20), ignorer les nouveaux tokens
+    if (this.pendingTransactions.size > 20) {
+      // Log unique pour éviter le spam (une seule fois toutes les 10 secondes)
+      const now = Date.now();
+      if (!this.lastQueueSaturatedLog || now - this.lastQueueSaturatedLog > 10000) {
+        console.log('⚠️ File d\'attente saturée (20+), nouveaux tokens ignorés temporairement.');
+        this.lastQueueSaturatedLog = now;
+      }
+      return;
+    }
+
     const isCreation = logs.some(log => 
       log.includes('Program log: Instruction: Create') || 
       log.includes('Program 6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23 invoke') ||
@@ -274,55 +285,24 @@ export class SolanaMonitor {
 
       console.log(`   ✅ Transaction récupérée (slot: ${transaction.slot})`);
 
-      const tokenData = await this.extractTokenData(transaction);
+      // LAZY LOADING STRICT : Extraction UNIQUEMENT depuis les logs (pas d'appel RPC)
+      const tokenData = this.extractTokenData(transaction);
       
       if (tokenData && tokenData.address) {
         console.log(`   ✅ Mint address trouvé: ${tokenData.address}`);
         
-        // FAST-PATH: Si métadonnées trouvées dans les logs, on skip l'enrichissement des métadonnées
-        // MAIS on récupère toujours les réserves depuis la blockchain (nécessaire pour Market Cap et Bonding Curve)
-        if (tokenData.metadata?.name && tokenData.metadata?.name !== 'Unknown') {
-          console.log(`   ✅ Métadonnées trouvées dans les logs: ${tokenData.metadata.name}, ${tokenData.metadata.symbol || 'N/A'}`);
-          
-          // Récupérer les réserves depuis la blockchain (nécessaire pour Market Cap et Bonding Curve)
-          console.log(`   🔗 Récupération des réserves depuis la blockchain...`);
-          const reserves = await fetchBondingCurveReserves(
-            tokenData.address,
-            { rpcUrl: this.rpcUrl, rpcKey: this.rpcKey }
-          );
-          
-          if (reserves) {
-            tokenData.reserves = reserves;
-            console.log(`   ✅ Réserves récupérées: ${reserves.vSolReserves.toFixed(2)} SOL, ${reserves.tokenReserves.toFixed(0)} tokens`);
-          } else {
-            console.log(`   ⚠️  Réserves non disponibles (bonding curve peut-être pas encore créée)`);
-          }
-          
-          if (this.onNewTokenCallback) {
-            this.onNewTokenCallback(tokenData);
-          }
-        } else {
-          // SLOW-PATH: Appel RPC complet (métadonnées + réserves)
-          console.log(`   🔍 Enrichissement complet (métadonnées + réserves)...`);
-          const enrichedTokenData = await this.enrichTokenData(tokenData.address);
-          const finalTokenData: TokenData = {
-            ...tokenData,
-            ...enrichedTokenData,
-            metadata: enrichedTokenData?.metadata || tokenData.metadata,
-            reserves: enrichedTokenData?.reserves || tokenData.reserves,
-          };
-          
-          if (finalTokenData.metadata?.name || finalTokenData.metadata?.symbol) {
-            console.log(`   ✅ Métadonnées finales: ${finalTokenData.metadata.name || 'N/A'}, ${finalTokenData.metadata.symbol || 'N/A'}`);
-          }
-          
-          if (finalTokenData.reserves) {
-            console.log(`   ✅ Réserves finales: ${finalTokenData.reserves.vSolReserves.toFixed(2)} SOL, ${finalTokenData.reserves.tokenReserves.toFixed(0)} tokens`);
-          }
-          
-          if (this.onNewTokenCallback) {
-            this.onNewTokenCallback(finalTokenData);
-          }
+        // Si le nom est "Unknown", on ignore le token (pas de quarantaine)
+        if (!tokenData.metadata?.name || tokenData.metadata.name === 'Unknown') {
+          console.log(`   ⏭️  Token ignoré (nom non trouvé dans les logs)`);
+          this.pendingTransactions.delete(signature);
+          return;
+        }
+        
+        console.log(`   ✅ Métadonnées trouvées dans les logs: ${tokenData.metadata.name}, ${tokenData.metadata.symbol || 'N/A'}`);
+        
+        // Envoyer le token à la quarantaine (index.ts se chargera de l'enrichissement après 30s)
+        if (this.onNewTokenCallback) {
+          this.onNewTokenCallback(tokenData);
         }
 
         this.pendingTransactions.delete(signature);
@@ -371,121 +351,22 @@ export class SolanaMonitor {
       
       return result;
     } catch (error) {
-      // Gérer les erreurs 429 avec backoff
+      // Gérer les erreurs 429 avec pause globale (géré par le rate limiter)
       if (axios.isAxiosError(error) && error.response?.status === 429) {
-        rpcRateLimiter.backoff();
-        // Silent - évite le spam dans les logs
+        rpcRateLimiter.handle429();
+        // Silent - le rate limiter gère déjà le logging discret
       }
       return null;
     }
   }
 
   /**
-   * Récupère les métadonnées off-chain (image + réseaux sociaux) depuis l'URI
-   * @param uri - URI des métadonnées (peut être IPFS ou HTTP)
-   * @returns Objet avec image et social (twitter, telegram, website)
+   * Extrait les données du token UNIQUEMENT depuis les logs de la transaction
+   * LAZY LOADING STRICT : Aucun appel RPC, aucune requête HTTP
+   * @param transaction - Transaction Solana
+   * @returns TokenData ou null si le nom est "Unknown"
    */
-  private async fetchOffChainMetadata(uri: string): Promise<{
-    image?: string;
-    social?: { twitter?: string; telegram?: string; website?: string };
-  }> {
-    try {
-      // Gérer les liens IPFS : ipfs:// -> https://ipfs.io/ipfs/
-      let jsonUrl = uri.trim();
-      if (jsonUrl.startsWith('ipfs://')) {
-        jsonUrl = jsonUrl.replace('ipfs://', 'https://ipfs.io/ipfs/');
-      } else if (jsonUrl.startsWith('ipfs/')) {
-        jsonUrl = `https://ipfs.io/${jsonUrl}`;
-      }
-
-      // Requête GET avec timeout court pour ne pas ralentir le bot
-      const response = await axios.get(jsonUrl, {
-        timeout: 1500,
-        headers: {
-          'Accept': 'application/json',
-        },
-      });
-
-      const json = response.data as Record<string, unknown>;
-
-      // Structure pump.fun : les réseaux sociaux peuvent être à la racine ou dans extensions
-      const social: { twitter?: string; telegram?: string; website?: string } = {};
-
-      // Chercher Twitter (plusieurs variantes possibles)
-      const twitter = 
-        json['twitter'] as string | undefined ||
-        json['Twitter'] as string | undefined ||
-        (json['extensions'] as Record<string, unknown> | undefined)?.['twitter'] as string | undefined ||
-        (json['extensions'] as Record<string, unknown> | undefined)?.['Twitter'] as string | undefined;
-      
-      if (twitter) {
-        // Nettoyer l'URL Twitter (enlever @ si présent, ajouter https:// si absent)
-        let twitterUrl = String(twitter).trim();
-        if (twitterUrl.startsWith('@')) {
-          twitterUrl = twitterUrl.substring(1);
-        }
-        if (twitterUrl && !twitterUrl.startsWith('http')) {
-          twitterUrl = `https://twitter.com/${twitterUrl}`;
-        }
-        if (twitterUrl) social.twitter = twitterUrl;
-      }
-
-      // Chercher Telegram
-      const telegram = 
-        json['telegram'] as string | undefined ||
-        json['Telegram'] as string | undefined ||
-        (json['extensions'] as Record<string, unknown> | undefined)?.['telegram'] as string | undefined ||
-        (json['extensions'] as Record<string, unknown> | undefined)?.['Telegram'] as string | undefined;
-      
-      if (telegram) {
-        let telegramUrl = String(telegram).trim();
-        if (telegramUrl && !telegramUrl.startsWith('http')) {
-          telegramUrl = `https://t.me/${telegramUrl.replace('@', '')}`;
-        }
-        if (telegramUrl) social.telegram = telegramUrl;
-      }
-
-      // Chercher Website
-      const website = 
-        json['website'] as string | undefined ||
-        json['Website'] as string | undefined ||
-        json['homepage'] as string | undefined ||
-        (json['extensions'] as Record<string, unknown> | undefined)?.['website'] as string | undefined;
-      
-      if (website) {
-        let websiteUrl = String(website).trim();
-        if (websiteUrl && !websiteUrl.startsWith('http')) {
-          websiteUrl = `https://${websiteUrl}`;
-        }
-        if (websiteUrl) social.website = websiteUrl;
-      }
-
-      // Chercher l'image
-      const image = 
-        json['image'] as string | undefined ||
-        json['Image'] as string | undefined ||
-        json['imageUrl'] as string | undefined;
-
-      // Gérer les images IPFS aussi
-      let imageUrl: string | undefined = undefined;
-      if (image) {
-        imageUrl = String(image).trim();
-        if (imageUrl.startsWith('ipfs://')) {
-          imageUrl = imageUrl.replace('ipfs://', 'https://ipfs.io/ipfs/');
-        }
-      }
-
-      return {
-        ...(imageUrl ? { image: imageUrl } : {}),
-        ...(Object.keys(social).length > 0 ? { social } : {}),
-      };
-    } catch (error) {
-      // Silent fail - si l'URI n'est pas accessible, on continue sans métadonnées off-chain
-      return {};
-    }
-  }
-
-  private async extractTokenData(transaction: SolanaTransaction): Promise<TokenData | null> {
+  private extractTokenData(transaction: SolanaTransaction): TokenData | null {
     try {
       let mintAddress: string | null = null;
       let name: string | undefined = undefined;
@@ -518,7 +399,7 @@ export class SolanaMonitor {
 
       if (!mintAddress) return null;
 
-      // FAST-PATH: Extraire name/symbol directement depuis les logs (évite l'appel RPC)
+      // PRIORITÉ AUX LOGS : Extraire name/symbol/uri UNIQUEMENT depuis les logs
       const logs = transaction.meta.logMessages || [];
       for (const log of logs) {
           // Chercher les patterns de métadonnées dans les logs
@@ -534,7 +415,7 @@ export class SolanaMonitor {
           }
       }
 
-      // Chercher aussi dans les instructions parsées
+      // Fallback : Chercher dans les instructions parsées (si pas trouvé dans les logs)
       if ((!name || !symbol) && transaction.transaction.message.instructions) {
         for (const inst of transaction.transaction.message.instructions) {
           if (inst?.parsed?.info) {
@@ -546,7 +427,7 @@ export class SolanaMonitor {
         }
       }
 
-      // Chercher dans les innerInstructions aussi
+      // Fallback : Chercher dans les innerInstructions (si pas trouvé dans les logs)
       if ((!name || !symbol || !uri) && transaction.meta.innerInstructions) {
         for (const inner of transaction.meta.innerInstructions) {
           if (inner?.instructions) {
@@ -562,61 +443,62 @@ export class SolanaMonitor {
         }
       }
 
-      // Si on a trouvé une URI, récupérer immédiatement les métadonnées off-chain (réseaux sociaux)
-      let offChainMetadata: {
-        image?: string;
-        social?: { twitter?: string; telegram?: string; website?: string };
-      } = {};
-
-      if (uri) {
-        console.log(`   🔗 URI trouvée dans les logs, récupération des métadonnées off-chain...`);
-        offChainMetadata = await this.fetchOffChainMetadata(uri);
-        
-        if (offChainMetadata.social && Object.keys(offChainMetadata.social).length > 0) {
-          const socials = Object.keys(offChainMetadata.social).join(', ');
-          console.log(`   ✅ Réseaux sociaux trouvés: ${socials}`);
-        }
+      // FILTRAGE IMMÉDIAT : Si le nom est "Unknown", retourner null (on ignore le token)
+      if (!name || name === 'Unknown') {
+        return null;
       }
 
+      // FILTRAGE EN AMONT : Rejeter les tokens de mauvaise qualité avant la quarantaine
+      const nameLower = name.toLowerCase().trim();
+      const symbolLower = (symbol || '').toLowerCase().trim();
+      
+      // Mots interdits dans le nom ou le symbole (test, shit, pump)
+      const blacklistWords = ['test', 'shit', 'pump'];
+      const hasBlacklistedWord = blacklistWords.some(word => 
+        nameLower.includes(word) || symbolLower.includes(word)
+      );
+      
+      // "coin" seul (pas dans un autre mot comme "coinbase" ou "coincidence")
+      const isCoinAlone = nameLower === 'coin' || symbolLower === 'coin' ||
+        /\bcoin\b/.test(nameLower) || /\bcoin\b/.test(symbolLower);
+      
+      // Vérifier si le nom contient uniquement des caractères chinois/russes (pas d'ASCII)
+      // Regex pour détecter les caractères chinois (CJK) et cyrilliques
+      const cjkCyrillicRegex = /^[\u4e00-\u9fff\u0400-\u04ff\s]+$/;
+      const isOnlyCjkCyrillic = cjkCyrillicRegex.test(name) && name.length > 0;
+      
+      // Rejeter si :
+      // - Contient un mot blacklisté (test, shit, pump)
+      // - Nom ou symbole est "coin" seul
+      // - Nom composé uniquement de caractères chinois/russes (sans ASCII)
+      if (hasBlacklistedWord || isCoinAlone || isOnlyCjkCyrillic) {
+        return null; // Ignorer le token immédiatement
+      }
+
+      // Retourner les données minimales (sans réserves, sans métadonnées off-chain)
+      // La quarantaine (index.ts) se chargera de l'enrichissement après 30s
       return {
         address: mintAddress,
-        metadata: name || symbol ? {
-          name: name || 'Unknown',
+        metadata: {
+          name: name,
           symbol: symbol || 'Unknown',
-          ...(offChainMetadata.image ? { image: offChainMetadata.image } : {}),
-          ...(offChainMetadata.social && Object.keys(offChainMetadata.social).length > 0 
-            ? { social: offChainMetadata.social } 
-            : {}),
-        } : undefined,
-        // Ne pas mettre de réserves par défaut - elles seront récupérées depuis la blockchain
-        // Si les réserves ne sont pas disponibles, calculateMarketCap retournera 0
-        reserves: undefined,
+          ...(uri ? { image: uri } : {}), // Stocker l'URI comme image temporairement
+        },
+        reserves: undefined, // Sera récupéré par la quarantaine
       };
     } catch (error) {
       return null;
     }
   }
 
-  private async enrichTokenData(mintAddress: string): Promise<TokenData | null> {
-    try {
-      // Utiliser le service optimisé blockchainDataService
-      const blockchainData = await fetchTokenDataFromBlockchain(
-        mintAddress,
-        { rpcUrl: this.rpcUrl, rpcKey: this.rpcKey }
-      );
-
-      if (blockchainData && blockchainData.metadata?.name) {
-        return {
-          address: mintAddress,
-          ...blockchainData,
-        } as TokenData;
-      }
-      
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
+  /**
+   * NOTE: Cette méthode n'est plus utilisée (Lazy Loading strict)
+   * L'enrichissement est maintenant fait par la quarantaine (index.ts) après 30s
+   * Conservée pour référence mais ne sera jamais appelée
+   */
+  // private async enrichTokenData(mintAddress: string): Promise<TokenData | null> {
+  //   // Supprimée - l'enrichissement est fait par la quarantaine
+  // }
 
   stop(): void {
     if (this.ws) this.ws.close();

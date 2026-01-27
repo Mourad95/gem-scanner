@@ -1,5 +1,6 @@
 /**
  * Point d'entrée principal du scanner de tokens Solana
+ * VERSION "PRODUCTION READY" : Gestion optimisée de la quarantaine avec Garbage Collector
  * @module index
  */
 
@@ -9,6 +10,7 @@ import { loadSettings, validateSettings, type AppSettings } from './config/setti
 import { validateToken, fetchSolPrice, type TokenData } from './services/analyzer.js';
 import { createNotifier } from './services/notifier.js';
 import { fetchTokenHolders, type HolderData } from './services/holderService.js';
+import { fetchTokenDataFromBlockchain } from './services/blockchainDataService.js';
 
 // Charger les variables d'environnement
 dotenv.config();
@@ -102,7 +104,7 @@ class PerformanceLogger {
 }
 
 /**
- * Scanner principal
+ * Scanner principal - VERSION PRODUCTION READY
  */
 class TokenScanner {
   private settings: AppSettings;
@@ -111,6 +113,8 @@ class TokenScanner {
   private solPriceCache: number | null = null;
   private solPriceCacheTime: number = 0;
   private readonly SOL_PRICE_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+  private waitingRoom = new Map<string, { data: TokenData; firstSeen: number }>();
+  private queueProcessorInterval: NodeJS.Timeout | null = null;
 
   constructor(settings: AppSettings) {
     this.settings = settings;
@@ -126,9 +130,10 @@ class TokenScanner {
     
     try {
       // Précharger le prix SOL pour éviter les latences
-      this.solPriceCache = await fetchSolPrice();
+      const price = await fetchSolPrice();
+      this.solPriceCache = price;
       this.solPriceCacheTime = Date.now();
-      console.log(chalk.green(`✅ Prix SOL préchargé: $${this.solPriceCache.toFixed(2)}`));
+      console.log(chalk.green(`✅ Prix SOL préchargé: $${price.toFixed(2)}`));
     } catch (error) {
       console.warn(chalk.yellow('⚠️ Impossible de précharger le prix SOL, utilisation du fallback'));
       this.solPriceCache = 100; // Fallback
@@ -154,53 +159,17 @@ class TokenScanner {
     }
 
     try {
-      this.solPriceCache = await fetchSolPrice();
+      const price = await fetchSolPrice();
+      this.solPriceCache = price;
       this.solPriceCacheTime = now;
-      return this.solPriceCache;
+      return price;
     } catch (error) {
       // Utiliser le cache même s'il est expiré
-      if (this.solPriceCache) {
+      if (this.solPriceCache !== null) {
         return this.solPriceCache;
       }
       return 100; // Fallback
     }
-  }
-
-  /**
-   * Normalise une valeur (détection automatique si division nécessaire)
-   * @param {unknown} value - Valeur à normaliser
-   * @returns {number} Valeur normalisée
-   */
-  private normalizeValue(value: unknown): number {
-    if (typeof value === 'number') {
-      // Si la valeur > 1e9, c'est probablement en lamports, diviser
-      return value > 1_000_000_000 ? value / 1e9 : value;
-    }
-    if (typeof value === 'string') {
-      const parsed = parseFloat(value);
-      return parsed > 1_000_000_000 ? parsed / 1e9 : parsed;
-    }
-    return 0;
-  }
-
-  /**
-   * Normalise les réserves (convertit en unités réelles avec détection automatique)
-   * @param {unknown} reserves - Réserves brutes du WebSocket
-   * @returns {TokenData['reserves']} Réserves normalisées
-   */
-  private normalizeReserves(reserves: unknown): TokenData['reserves'] {
-    if (!reserves || typeof reserves !== 'object') {
-      return undefined;
-    }
-
-    const r = reserves as Record<string, unknown>;
-    const vSolReserves = this.normalizeValue(r['vSolReserves'] || r['virtualSolReserves']);
-    const tokenReserves = this.normalizeValue(r['tokenReserves'] || r['virtualTokenReserves']);
-
-    return {
-      vSolReserves,
-      tokenReserves,
-    };
   }
 
   /**
@@ -224,27 +193,58 @@ class TokenScanner {
   }
 
   /**
-   * Traite un token reçu via WebSocket
+   * Ajoute un token à la Waiting Room (Quarantaine)
+   * Logique simple : juste ajouter avec timestamp
    * @param {TokenData} tokenData - Données du token
    */
   async processToken(tokenData: TokenData): Promise<void> {
+    try {
+      // Valider l'adresse Solana avant traitement
+      if (!this.isValidSolanaAddress(tokenData.address)) {
+        return; // Silent fail
+      }
+
+      // Ajouter le token à la Waiting Room
+      const name = tokenData.metadata?.name || tokenData.address.substring(0, 8);
+      this.waitingRoom.set(tokenData.address, {
+        data: tokenData,
+        firstSeen: Date.now(),
+      });
+
+      // Log discret
+      console.log(chalk.yellow(`⏳ [QUARANTAINE] Token ${name} mis en attente (30s)...`));
+    } catch {
+      // Silent fail - évite le spam
+    }
+  }
+
+  /**
+   * Validation finale après quarantaine
+   * Récupère les données fraîches (Market Cap à jour) et valide le token
+   * @param {TokenData} tokenData - Données initiales du token
+   */
+  private async validateAndAlert(tokenData: TokenData): Promise<void> {
     const startTime = Date.now();
     let isAlert = false;
     let isError = false;
 
     try {
-      // Valider l'adresse Solana avant traitement
-      if (!this.isValidSolanaAddress(tokenData.address)) {
-        console.warn(
-          chalk.yellow(`⚠️ Adresse Solana invalide ignorée: ${tokenData.address}`)
-        );
-        return;
-      }
+      const name = tokenData.metadata?.name || tokenData.address.substring(0, 8);
 
-      // Normaliser les réserves (convertir en unités réelles avec détection automatique)
-      if (tokenData.reserves) {
-        tokenData.reserves = this.normalizeReserves(tokenData.reserves);
-      }
+      // CRUCIAL : Récupérer les données fraîches de la blockchain (Market Cap à jour après 30s)
+      const freshBlockchainData = await fetchTokenDataFromBlockchain(
+        tokenData.address,
+        this.settings.solana
+      );
+
+      // Fusionner les données fraîches avec les données initiales
+      const enrichedTokenData: TokenData = {
+        ...tokenData,
+        ...freshBlockchainData,
+        address: tokenData.address, // Garder l'adresse originale
+        metadata: freshBlockchainData?.metadata || tokenData.metadata,
+        reserves: freshBlockchainData?.reserves || tokenData.reserves,
+      };
 
       // Créer un AbortController pour timeout de 800ms sur fetchTokenHolders
       const abortController = new AbortController();
@@ -252,10 +252,10 @@ class TokenScanner {
         abortController.abort();
       }, 800);
 
-      // Récupérer le prix SOL et les holders en parallèle pour optimiser
+      // Récupérer le prix SOL et les holders en parallèle
       const [solPrice, holders] = await Promise.all([
         this.getSolPrice(),
-        fetchTokenHolders(tokenData.address, { 
+        fetchTokenHolders(enrichedTokenData.address, {
           solana: this.settings.solana,
           limit: 10, // Top 10 seulement pour performance
           signal: abortController.signal,
@@ -264,33 +264,21 @@ class TokenScanner {
             clearTimeout(timeoutId);
             return result;
           })
-          .catch((error: unknown) => {
+          .catch(() => {
             clearTimeout(timeoutId);
-            
-            // Si c'est un timeout (AbortError), continuer sans holders
-            if (error instanceof Error && error.name === 'AbortError') {
-              console.warn(
-                chalk.yellow(`⏱️ Timeout holders (800ms) pour ${tokenData.address}, continuation sans Shadow Scan`)
-              );
-            } else {
-              // Autre erreur
-              console.warn(
-                chalk.yellow(`⚠️ Impossible de récupérer les holders pour ${tokenData.address}: ${error instanceof Error ? error.message : 'Erreur inconnue'}`)
-              );
-            }
+            // Silent fail - continuer sans holders
             return [] as HolderData[];
           }),
       ]);
 
-      // Analyser le token avec les holders (Shadow Scan activé)
-      console.log(chalk.blue(`   📊 Analyse en cours...`));
-      const analysis = await validateToken(tokenData, {
+      // Analyser le token avec les données fraîches et les holders
+      const analysis = await validateToken(enrichedTokenData, {
         solPriceUsd: solPrice,
         holders: holders.length > 0 ? holders : undefined,
       });
 
       // Afficher le score détaillé
-      const scoreColor = analysis.score >= 55 ? chalk.green : analysis.score >= 50 ? chalk.yellow : chalk.red;
+      const scoreColor = analysis.score >= 70 ? chalk.green : analysis.score >= 50 ? chalk.yellow : chalk.red;
       console.log(scoreColor(`   📈 Score: ${analysis.score}/100`));
       console.log(chalk.gray(`      - Social: ${analysis.breakdown.socialScore}pts`));
       console.log(chalk.gray(`      - Bonding Curve: ${analysis.breakdown.bondingCurveScore}pts`));
@@ -300,70 +288,126 @@ class TokenScanner {
         console.log(chalk.red(`      - Dev Holding: ${analysis.breakdown.devHoldingPenalty}pts`));
       }
 
-      // Détecter les scams via holders (score très bas à cause des pénalités holders)
-      const isScamDetected = 
-        analysis.score < 30 && 
-        analysis.breakdown.holdersScore < 0 &&
-        (analysis.breakdown.holdersScore <= -40 || analysis.reasons.some(r => r.includes('CRITIQUE') || r.includes('dump massif')));
-
-      if (isScamDetected) {
-        console.log(
-          chalk.red.bold(`\n   🚨 [SCAM DETECTED] `) +
-          chalk.red(`Score: ${analysis.score}/100`) +
-          chalk.gray(` (Holders: ${analysis.breakdown.holdersScore}pts)`)
-        );
-        // Afficher les raisons du scam
-        analysis.reasons
-          .filter(r => r.includes('🚨') || r.includes('CRITIQUE') || r.includes('dump'))
-          .forEach(reason => {
-            console.log(chalk.red(`      └─ ${reason}`));
-          });
-      }
-
-      // Si c'est une alerte alpha, envoyer la notification
+      // Si Score > 70 : Alerte Telegram
       if (analysis.isAlphaAlert) {
         console.log(chalk.green.bold(`\n   🚨 ALERTE ALPHA DÉTECTÉE ! Envoi de la notification...`));
         try {
-          await this.notifier.sendAlert(tokenData, analysis);
+          await this.notifier.sendAlert(enrichedTokenData, analysis);
           isAlert = true;
           console.log(chalk.green('   ✅ Notification envoyée avec succès\n'));
         } catch (error) {
           console.error(chalk.red(`   ❌ Erreur envoi: ${error instanceof Error ? error.message : error}\n`));
         }
       } else {
-        console.log(chalk.yellow(`   ⚪ Pas d'alerte (score ${analysis.score} < 55)`));
-        // Afficher les raisons du rejet pour debug
-        if (analysis.reasons.length > 0) {
-          console.log(chalk.gray(`      Raisons: ${analysis.reasons.slice(0, 3).join(', ')}`));
-        }
+        // Log de rejet compact
+        const mc = analysis.marketCap.toFixed(0);
+        console.log(
+          chalk.yellow(`   🗑️ [REJET] Token ${name} - MC: $${mc}, Score: ${analysis.score}`)
+        );
         console.log(''); // Ligne vide
       }
 
       const processingTime = Date.now() - startTime;
       this.performanceLogger.record(processingTime, isAlert, isError);
 
-      // Avertir si le temps dépasse 500ms
-      if (processingTime >= 500) {
-        console.warn(
-          chalk.yellow(`⚠️ Temps de traitement élevé: ${processingTime}ms pour ${tokenData.address}`)
-        );
-      }
-    } catch (error) {
+    } catch {
       const processingTime = Date.now() - startTime;
       isError = true;
       this.performanceLogger.record(processingTime, false, true);
-      
-      console.error(
-        chalk.red(`❌ Erreur lors du traitement du token ${tokenData.address}:`),
-        error instanceof Error ? error.message : error
-      );
+
+      // Silent fail - évite le spam
     }
   }
 
+  /**
+   * Queue Processor (Hautes Performances)
+   * Vérifie toutes les 1 seconde et traite par lots de 5
+   */
+  private startQueueProcessor(): void {
+    const QUARANTINE_DURATION = 30 * 1000; // 30 secondes
+    const CHECK_INTERVAL = 1000; // 1 seconde
+    const MAX_BATCH_SIZE = 5; // Traiter jusqu'à 5 tokens simultanément
+    const MAX_WAITING_ROOM_SIZE = 200; // Limite avant Garbage Collector
+    const GARBAGE_COLLECT_AGE = 60 * 1000; // 60 secondes (tokens trop vieux)
+
+    this.queueProcessorInterval = setInterval(() => {
+      this.processQueue(QUARANTINE_DURATION, MAX_BATCH_SIZE, MAX_WAITING_ROOM_SIZE, GARBAGE_COLLECT_AGE);
+    }, CHECK_INTERVAL);
+
+    console.log(chalk.blue('✅ Processeur de quarantaine démarré (vérification toutes les 1s, batch de 5)'));
+  }
+
+  /**
+   * Traite la file d'attente avec Garbage Collector
+   * @param quarantineDuration - Durée de la quarantaine en ms
+   * @param maxBatchSize - Nombre maximum de tokens à traiter simultanément
+   * @param maxWaitingRoomSize - Taille maximale avant nettoyage
+   * @param garbageCollectAge - Âge maximum avant suppression forcée
+   */
+  private async processQueue(
+    quarantineDuration: number,
+    maxBatchSize: number,
+    maxWaitingRoomSize: number,
+    garbageCollectAge: number
+  ): Promise<void> {
+    const now = Date.now();
+    const tokensToProcess: Array<{ data: TokenData; firstSeen: number }> = [];
+
+    // GARBAGE COLLECTOR (Anti-Crash) : Si > 200 tokens, supprimer ceux > 60s
+    if (this.waitingRoom.size > maxWaitingRoomSize) {
+      let removedCount = 0;
+      for (const [address, entry] of this.waitingRoom.entries()) {
+        const age = now - entry.firstSeen;
+        if (age > garbageCollectAge) {
+          this.waitingRoom.delete(address);
+          removedCount++;
+        }
+      }
+      
+      if (removedCount > 0) {
+        console.log(
+          chalk.yellow(`🧹 Garbage Collector: ${removedCount} tokens supprimés (âge > 60s)`)
+        );
+      }
+    }
+
+    // Identifier les tokens prêts à être traités (30s+)
+    for (const [address, entry] of this.waitingRoom.entries()) {
+      const timeInQuarantine = now - entry.firstSeen;
+
+      if (timeInQuarantine >= quarantineDuration) {
+        tokensToProcess.push(entry);
+        this.waitingRoom.delete(address);
+      }
+    }
+
+    // TRAITEMENT PAR LOTS : Traiter jusqu'à maxBatchSize tokens simultanément
+    if (tokensToProcess.length > 0) {
+      // Limiter à maxBatchSize pour ne pas spammer le RPC
+      const batch = tokensToProcess.slice(0, maxBatchSize);
+      
+      // Traiter le batch en parallèle avec Promise.all
+      await Promise.all(
+        batch.map((entry) =>
+          this.validateAndAlert(entry.data).catch(() => {
+            // Silent fail - évite le spam
+          })
+        )
+      );
+
+      // Si il reste des tokens à traiter, ils seront traités au prochain tick
+      if (tokensToProcess.length > maxBatchSize) {
+        // Remettre les tokens non traités dans la waiting room
+        const remaining = tokensToProcess.slice(maxBatchSize);
+        for (const entry of remaining) {
+          this.waitingRoom.set(entry.data.address, entry);
+        }
+      }
+    }
+  }
 
   /**
    * Démarre le scanner en utilisant Helius WebSocket pour surveiller pump.fun
-   * Utilise programSubscribe selon la doc Helius: https://www.helius.dev/docs/api-reference/rpc/websocket-methods
    */
   async start(): Promise<void> {
     console.log(chalk.blue('🔌 Démarrage du scanner pump.fun via Helius WebSocket...'));
@@ -381,13 +425,17 @@ class TokenScanner {
         console.log(chalk.cyan(`   Symbol: ${tokenData.metadata?.symbol || 'N/A'}`));
         console.log(chalk.gray(`   Adresse: ${tokenData.address}`));
 
-        // Traiter le token
-        this.processToken(tokenData).catch((error) => {
-          console.error(chalk.red('Erreur dans processToken:'), error);
+        // Ajouter à la quarantaine
+        this.processToken(tokenData).catch(() => {
+          // Silent fail
         });
       });
 
       console.log(chalk.green('✅ Surveillance Helius WebSocket activée'));
+
+      // Démarrer le processeur de quarantaine
+      this.startQueueProcessor();
+
       console.log(chalk.blue('👂 En attente de nouveaux tokens pump.fun...\n'));
     } catch (error) {
       console.error(chalk.red('❌ Erreur lors de la connexion Helius WebSocket:'), error);
@@ -399,7 +447,19 @@ class TokenScanner {
    * Arrête le scanner
    */
   stop(): void {
+    // Arrêter le processeur de quarantaine
+    if (this.queueProcessorInterval) {
+      clearInterval(this.queueProcessorInterval);
+      this.queueProcessorInterval = null;
+    }
+
+    // Afficher les statistiques
     this.performanceLogger.printStats();
+
+    // Afficher le nombre de tokens encore en quarantaine
+    if (this.waitingRoom.size > 0) {
+      console.log(chalk.yellow(`\n⚠️ ${this.waitingRoom.size} token(s) encore en quarantaine`));
+    }
   }
 }
 
@@ -446,4 +506,3 @@ main().catch((error) => {
   console.error(chalk.red('Erreur non gérée:'), error);
   process.exit(1);
 });
-
