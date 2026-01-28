@@ -113,7 +113,7 @@ class TokenScanner {
   private solPriceCache: number | null = null;
   private solPriceCacheTime: number = 0;
   private readonly SOL_PRICE_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
-  private waitingRoom = new Map<string, { data: TokenData; firstSeen: number }>();
+  private waitingRoom = new Map<string, { data: TokenData; firstSeen: number; logCount: number }>();
   private queueProcessorInterval: NodeJS.Timeout | null = null;
 
   constructor(settings: AppSettings) {
@@ -194,7 +194,7 @@ class TokenScanner {
 
   /**
    * Ajoute un token à la Waiting Room (Quarantaine)
-   * Logique simple : juste ajouter avec timestamp
+   * Logique simple : juste ajouter avec timestamp et incrémenter logCount
    * @param {TokenData} tokenData - Données du token
    */
   async processToken(tokenData: TokenData): Promise<void> {
@@ -204,11 +204,16 @@ class TokenScanner {
         return; // Silent fail
       }
 
-      // Ajouter le token à la Waiting Room
+      // Vérifier si le token existe déjà dans la waiting room
+      const existing = this.waitingRoom.get(tokenData.address);
+      const logCount = existing ? existing.logCount + 1 : 1;
+
+      // Ajouter ou mettre à jour le token dans la Waiting Room
       const name = tokenData.metadata?.name || tokenData.address.substring(0, 8);
       this.waitingRoom.set(tokenData.address, {
         data: tokenData,
-        firstSeen: Date.now(),
+        firstSeen: existing?.firstSeen || Date.now(), // Garder le timestamp initial
+        logCount,
       });
 
       // Log discret
@@ -222,8 +227,10 @@ class TokenScanner {
    * Validation finale après quarantaine
    * Récupère les données fraîches (Market Cap à jour) et valide le token
    * @param {TokenData} tokenData - Données initiales du token
+   * @param {number} logCount - Nombre de logs vus pendant la quarantaine
+   * @param {number} duration - Durée de la quarantaine en ms
    */
-  private async validateAndAlert(tokenData: TokenData): Promise<void> {
+  private async validateAndAlert(tokenData: TokenData, logCount: number = 0, duration: number = 0): Promise<void> {
     const startTime = Date.now();
     let isAlert = false;
     let isError = false;
@@ -231,10 +238,15 @@ class TokenScanner {
     try {
       const name = tokenData.metadata?.name || tokenData.address.substring(0, 8);
 
+      // Log avant l'analyse
+      console.log(chalk.blue(`🔍 Analyse de ${name} (Logs: ${logCount}, Waited: ${duration}ms)`));
+
       // CRUCIAL : Récupérer les données fraîches de la blockchain (Market Cap à jour après 30s)
+      // Passer les métadonnées existantes pour optimiser (skip Metaplex si on a déjà name/symbol)
       const freshBlockchainData = await fetchTokenDataFromBlockchain(
         tokenData.address,
-        this.settings.solana
+        this.settings.solana,
+        tokenData.metadata ? { name: tokenData.metadata.name, symbol: tokenData.metadata.symbol } : undefined
       );
 
       // Fusionner les données fraîches avec les données initiales
@@ -275,20 +287,24 @@ class TokenScanner {
       const analysis = await validateToken(enrichedTokenData, {
         solPriceUsd: solPrice,
         holders: holders.length > 0 ? holders : undefined,
+        logCount: logCount, // Important pour le bonus vélocité
       });
 
       // Afficher le score détaillé
-      const scoreColor = analysis.score >= 70 ? chalk.green : analysis.score >= 50 ? chalk.yellow : chalk.red;
+      const scoreColor = analysis.score >= 75 ? chalk.green : analysis.score >= 50 ? chalk.yellow : chalk.red;
       console.log(scoreColor(`   📈 Score: ${analysis.score}/100`));
       console.log(chalk.gray(`      - Social: ${analysis.breakdown.socialScore}pts`));
       console.log(chalk.gray(`      - Bonding Curve: ${analysis.breakdown.bondingCurveScore}pts`));
       console.log(chalk.gray(`      - Anti-Rug: ${analysis.breakdown.antiRugScore}pts`));
       console.log(chalk.gray(`      - Holders: ${analysis.breakdown.holdersScore}pts`));
+      if (analysis.breakdown.velocityScore > 0) {
+        console.log(chalk.cyan(`      - Vélocité: ${analysis.breakdown.velocityScore}pts`));
+      }
       if (analysis.breakdown.devHoldingPenalty < 0) {
         console.log(chalk.red(`      - Dev Holding: ${analysis.breakdown.devHoldingPenalty}pts`));
       }
 
-      // Si Score > 70 : Alerte Telegram
+      // Si Score > 75 : Alerte Telegram
       if (analysis.isAlphaAlert) {
         console.log(chalk.green.bold(`\n   🚨 ALERTE ALPHA DÉTECTÉE ! Envoi de la notification...`));
         try {
@@ -351,7 +367,7 @@ class TokenScanner {
     garbageCollectAge: number
   ): Promise<void> {
     const now = Date.now();
-    const tokensToProcess: Array<{ data: TokenData; firstSeen: number }> = [];
+    const tokensToProcess: Array<{ data: TokenData; firstSeen: number; logCount: number }> = [];
 
     // GARBAGE COLLECTOR (Anti-Crash) : Si > 200 tokens, supprimer ceux > 60s
     if (this.waitingRoom.size > maxWaitingRoomSize) {
@@ -388,11 +404,12 @@ class TokenScanner {
       
       // Traiter le batch en parallèle avec Promise.all
       await Promise.all(
-        batch.map((entry) =>
-          this.validateAndAlert(entry.data).catch(() => {
+        batch.map((entry) => {
+          const duration = now - entry.firstSeen;
+          return this.validateAndAlert(entry.data, entry.logCount, duration).catch(() => {
             // Silent fail - évite le spam
-          })
-        )
+          });
+        })
       );
 
       // Si il reste des tokens à traiter, ils seront traités au prochain tick

@@ -14,7 +14,7 @@ import { rpcRateLimiter } from './rateLimiter.js';
  * Constantes des Programmes
  */
 const METAPLEX_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
-const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23');
+const PROGRAM_ID = new PublicKey('6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23');
 
 /**
  * Petit utilitaire pour faire une pause
@@ -102,21 +102,17 @@ function getMetadataAddress(mintAddress: string): string {
 
 /**
  * Dérive l'adresse de la Bonding Curve pump.fun (PDA)
+ * Formule exacte selon la spécification pump.fun
  */
-function getBondingCurveAddress(mintAddress: string): string {
-  try {
-    const mint = new PublicKey(mintAddress);
-    const [pda] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from('bonding-curve'),
-        mint.toBuffer(),
-      ],
-      PUMP_PROGRAM_ID
-    );
-    return pda.toBase58();
-  } catch (e) {
-    return '';
-  }
+function getBondingCurveAddress(mintAddress: string): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('bonding-curve'),
+      new PublicKey(mintAddress).toBuffer(),
+    ],
+    PROGRAM_ID
+  );
+  return pda;
 }
 
 function sanitizeString(str: string): string {
@@ -520,7 +516,7 @@ async function fetchMetaplexMetadataWithRetry(
 
 /**
  * Récupère les réserves réelles de la Bonding Curve
- * Utilise Connection de @solana/web3.js
+ * Utilise Connection de @solana/web3.js avec retry loop robuste
  * @export pour utilisation dans solanaMonitor.ts
  */
 export async function fetchBondingCurveReserves(
@@ -528,37 +524,83 @@ export async function fetchBondingCurveReserves(
   solana: SolanaConfig
 ): Promise<{ vSolReserves: number; tokenReserves: number } | null> {
   try {
-    const curveAddress = getBondingCurveAddress(mintAddress);
-    if (!curveAddress) return null;
+    // 1. Calcul PDA Robuste avec la formule exacte
+    const curvePublicKey = getBondingCurveAddress(mintAddress);
+    const curveAddress = curvePublicKey.toBase58();
+    console.log(`   🔍 Bonding curve PDA: ${curveAddress} (mint: ${mintAddress.substring(0, 16)}...)`);
 
     const connection = createConnection(solana);
-    const publicKey = new PublicKey(curveAddress);
     
-    // Utiliser getAccountInfo avec rate limiting
-    const accountInfo = await rpcRateLimiter.execute(async () => {
-      return await Promise.race([
-        connection.getAccountInfo(publicKey),
-        new Promise<null>((_, reject) => 
-          setTimeout(() => reject(new Error('Timeout')), 2000)
-        ),
-      ]) as { data: Buffer } | null;
-    });
+    // 2. Retry Loop (La Tenacité) - 3 tentatives
+    let accountInfo: { data: Buffer } | null = null;
+    const maxAttempts = 3;
+    
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        // Utiliser 'processed' pour la première tentative (plus rapide), puis 'confirmed'
+        const commitment = attempt === 0 ? 'processed' : 'confirmed';
+        
+        accountInfo = await rpcRateLimiter.execute(async () => {
+          return await Promise.race([
+            connection.getAccountInfo(curvePublicKey, { commitment }),
+            new Promise<null>((_, reject) => 
+              setTimeout(() => reject(new Error('Timeout')), 3000)
+            ),
+          ]) as { data: Buffer } | null;
+        });
 
-    // ROBUSTESSE : Si le compte n'existe pas encore (bonding curve pas encore créée),
-    // retourner les valeurs par défaut de départ pump.fun pour permettre au calcul de continuer
+        // Si on a trouvé le compte, sortir de la boucle
+        if (accountInfo && accountInfo.data) {
+          console.log(`   ✅ Bonding curve trouvée à la tentative ${attempt + 1}/${maxAttempts} (commitment: ${commitment})`);
+          break;
+        }
+
+        // Si ce n'est pas la dernière tentative, attendre 500ms
+        if (attempt < maxAttempts - 1) {
+          await sleep(500);
+        }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Erreur inconnue';
+        if (attempt < maxAttempts - 1) {
+          console.log(`   ⚠️  Tentative ${attempt + 1}/${maxAttempts} échouée: ${errorMsg.substring(0, 50)}`);
+          await sleep(500);
+          continue;
+        }
+        // Dernière tentative échouée, on sortira avec accountInfo = null
+        console.log(`   ⚠️  Dernière tentative échouée: ${errorMsg.substring(0, 50)}`);
+      }
+    }
+
+    // Si le compte n'existe toujours pas après 3 tentatives, retourner null
+    // (ne pas retourner les valeurs par défaut qui masquent le problème)
     if (!accountInfo || !accountInfo.data) {
-      // Valeurs de départ pump.fun : 30 SOL, 1 milliard de tokens
-      return {
-        vSolReserves: 30,
-        tokenReserves: 1_000_000_000
-      };
+      console.log(`   ⚠️  Bonding curve non trouvée après ${maxAttempts} tentatives (PDA: ${curveAddress})`);
+      return null;
     }
 
     const buffer = accountInfo.data;
     
-    // Layout Pump.fun
-    const virtualTokenReserves = Number(buffer.readBigUInt64LE(8)) / 1e6;
-    const virtualSolReserves = Number(buffer.readBigUInt64LE(16)) / 1e9;
+    // 3. Décodage correct des offsets
+    // Structure Pump.fun Bonding Curve:
+    // - discriminator: 8 bytes (offset 0-7)
+    // - virtualTokenReserves: 8 bytes uint64 (offset 8-15)
+    // - virtualSolReserves: 8 bytes uint64 (offset 16-23)
+    
+    if (buffer.length < 24) {
+      console.log(`   ⚠️  Buffer bonding curve trop court: ${buffer.length} bytes (attendu au moins 24)`);
+      return null;
+    }
+
+    // Lire virtualTokenReserves (uint64, offset 8)
+    const virtualTokenReservesRaw = buffer.readBigUInt64LE(8);
+    const virtualTokenReserves = Number(virtualTokenReservesRaw) / 1e6; // Diviser par 1e6 car decimals = 6
+
+    // Lire virtualSolReserves (uint64, offset 16)
+    const virtualSolReservesRaw = buffer.readBigUInt64LE(16);
+    const virtualSolReserves = Number(virtualSolReservesRaw) / 1e9; // Diviser par 1e9 car SOL a 9 decimals
+
+    // Logue les valeurs lues
+    console.log(`   ✅ Curve lue: ${virtualSolReserves.toFixed(2)} SOL / ${virtualTokenReserves.toFixed(0)} Tokens`);
 
     return {
       vSolReserves: virtualSolReserves,
@@ -566,30 +608,43 @@ export async function fetchBondingCurveReserves(
     };
 
   } catch (error) {
-    // En cas d'erreur, retourner les valeurs par défaut pour éviter de crasher le score
-    // Cela permet au calcul de Market Cap de continuer avec des valeurs de départ
-    return {
-      vSolReserves: 30,
-      tokenReserves: 1_000_000_000
-    };
+    const errorMsg = error instanceof Error ? error.message : 'Erreur inconnue';
+    console.log(`   ⚠️  Erreur lors de la récupération de la bonding curve: ${errorMsg.substring(0, 100)}`);
+    return null;
   }
 }
 
 /**
  * Point d'entrée principal pour l'enrichissement
+ * @param existingMetadata - Métadonnées existantes (name, symbol) venant des logs. Si fournies, on skip Metaplex.
  */
 export async function fetchTokenDataFromBlockchain(
   mintAddress: string,
-  solana: SolanaConfig
+  solana: SolanaConfig,
+  existingMetadata?: { name?: string; symbol?: string }
 ): Promise<Partial<TokenData> | null> {
   try {
     console.log(`   🔗 Récupération depuis la blockchain Solana...`);
     
-    // On lance la métadonnée et la courbe en parallèle
-    const [metadata, reserves] = await Promise.all([
-      fetchMetaplexMetadataWithRetry(mintAddress, solana),
-      fetchBondingCurveReserves(mintAddress, solana)
-    ]);
+    // 4. Optimisation Metaplex : Si on a déjà name et symbol, NE PAS appeler Metaplex
+    let metadata: { name?: string; symbol?: string; description?: string; image?: string; uri?: string; social?: any } | null = null;
+    
+    if (existingMetadata?.name && existingMetadata?.symbol) {
+      // On a déjà les métadonnées de base depuis les logs, on skip Metaplex
+      console.log(`   ⚡ Métadonnées déjà disponibles (name: ${existingMetadata.name}, symbol: ${existingMetadata.symbol}), skip Metaplex`);
+      metadata = {
+        name: existingMetadata.name,
+        symbol: existingMetadata.symbol,
+        // On peut quand même essayer de récupérer description/image via URI si nécessaire
+        // mais pour l'instant on garde juste name/symbol pour gagner du temps
+      };
+    } else {
+      // On n'a pas les métadonnées, on les récupère via Metaplex
+      metadata = await fetchMetaplexMetadataWithRetry(mintAddress, solana);
+    }
+    
+    // Récupérer les réserves en parallèle (toujours nécessaire)
+    const reserves = await fetchBondingCurveReserves(mintAddress, solana);
 
     if (!metadata && !reserves) return null;
 

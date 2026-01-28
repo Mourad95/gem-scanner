@@ -131,7 +131,10 @@ export class TelegramNotifier {
       scoreLabel = 'MOYEN';
     }
 
-    let message = `🚨 *ALERTE ALPHA DÉTECTÉE* 🚨\n\n`;
+    // Emoji spécial pour les scores > 90 (Top Tier / CopperInu Style)
+    const alertEmoji = score > 90 ? '💎' : '🚀';
+    const alertTitle = score > 90 ? '*ALERTE ALPHA MAXIMALE*' : '*ALERTE ALPHA DÉTECTÉE*';
+    let message = `${alertEmoji} ${alertTitle} ${alertEmoji}\n\n`;
     
     // Informations du token
     message += `*${name}* \\(${symbol}\\)\n`;
@@ -175,6 +178,9 @@ export class TelegramNotifier {
     message += `• Bonding Curve: ${this.escapeMarkdown(String(analysis.breakdown.bondingCurveScore))}pts\n`;
     message += `• Anti\\-Rug: ${this.escapeMarkdown(String(analysis.breakdown.antiRugScore))}pts\n`;
     message += `• Holders: ${this.escapeMarkdown(String(analysis.breakdown.holdersScore))}pts\n`;
+    if (analysis.breakdown.velocityScore > 0) {
+      message += `• Vélocité: ${this.escapeMarkdown(String(analysis.breakdown.velocityScore))}pts\n`;
+    }
     if (analysis.breakdown.devHoldingPenalty < 0) {
       message += `• Dev Holding: ${this.escapeMarkdown(String(analysis.breakdown.devHoldingPenalty))}pts\n`;
     }
@@ -250,7 +256,7 @@ export class TelegramNotifier {
     try {
       // Vérifier que c'est bien une alerte alpha
       if (!analysis.isAlphaAlert) {
-        throw new Error('Le token ne passe pas le filtre Alpha (score <= 70)');
+        throw new Error('Le token ne passe pas le filtre Alpha (score <= 75)');
       }
 
       const message = this.formatMessage(token, analysis);

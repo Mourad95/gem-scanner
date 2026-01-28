@@ -1,4 +1,4 @@
-.PHONY: help install build start stop restart logs clean test docker-build docker-up docker-down docker-logs docker-restart docker-clean setup check
+.PHONY: help install build start stop restart logs clean test docker-build docker-up docker-down docker-logs docker-restart docker-clean docker-clean-api setup check
 
 # Variables
 DOCKER_COMPOSE = docker-compose
@@ -136,6 +136,20 @@ docker-clean: ## Nettoie les conteneurs, images et volumes Docker
 		$(DOCKER_COMPOSE) down -v; \
 		docker system prune -f; \
 		echo "$(GREEN)✅ Nettoyage terminé$(NC)"; \
+	else \
+		echo "$(YELLOW)❌ Nettoyage annulé$(NC)"; \
+	fi
+
+docker-clean-api: ## Nettoie uniquement le conteneur et l'image de l'API (scanner)
+	@echo "$(YELLOW)🧹 Nettoyage de l'API (scanner)...$(NC)"
+	@read -p "⚠️  Cela supprimera le conteneur et l'image du scanner. Continuer? [y/N] " -n 1 -r; \
+	echo; \
+	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+		$(DOCKER_COMPOSE) stop scanner 2>/dev/null || true; \
+		$(DOCKER_COMPOSE) rm -f scanner 2>/dev/null || true; \
+		docker rmi $$($(DOCKER_COMPOSE) images -q scanner) 2>/dev/null || true; \
+		echo "$(GREEN)✅ Nettoyage de l'API terminé$(NC)"; \
+		echo "$(YELLOW)ℹ️  Ollama n'a pas été affecté$(NC)"; \
 	else \
 		echo "$(YELLOW)❌ Nettoyage annulé$(NC)"; \
 	fi

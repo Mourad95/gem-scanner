@@ -1,89 +1,52 @@
 /**
  * Service pour surveiller les nouveaux tokens pump.fun via Solana RPC WebSocket
- * VERSION OPTIMISÉE "ANTI-429" : Évite les appels inutiles
+ * VERSION "ZÉRO APPEL RPC" : Extraction purement textuelle depuis les logs
  * @module services/solanaMonitor
  */
 
 import WebSocket from 'ws';
 import axios from 'axios';
+import { PublicKey } from '@solana/web3.js';
 import type { TokenData } from './analyzer.js';
 import type { SolanaConfig } from '../config/settings.js';
-import { rpcRateLimiter } from './rateLimiter.js';
 
 const PUMP_FUN_BONDING_CURVE = '6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23';
 const MAYHEM_PROGRAM_ID = 'MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e';
 
-interface ParsedInstruction {
-  program: string;
-  programId: string;
-  parsed?: {
-    type: string;
-    info?: Record<string, unknown>;
-  };
-  accounts?: string[];
-  data?: string;
+/**
+ * Données extraites depuis les logs
+ */
+interface ParsedTokenLog {
+  mint: string | null;
+  name: string;
+  symbol: string;
+  uri: string;
 }
 
-interface SolanaTransaction {
+/**
+ * Cache pour éviter les doublons (protection anti-flood)
+ */
+interface ProcessedLog {
   signature: string;
-  slot: number;
-  blockTime: number | null;
-  meta: {
-    err: unknown;
-    fee: number;
-    innerInstructions?: Array<{
-      index: number;
-      instructions: ParsedInstruction[];
-    }>;
-    logMessages: string[];
-    postBalances: number[];
-    preBalances: number[];
-    postTokenBalances?: Array<{
-      accountIndex: number;
-      mint: string;
-      owner?: string;
-      uiTokenAmount?: {
-        uiAmount: number;
-        decimals: number;
-      };
-    }>;
-    preTokenBalances?: Array<{
-      accountIndex: number;
-      mint: string;
-    }>;
-  };
-  transaction: {
-    message: {
-      accountKeys: Array<{
-        pubkey: string;
-        signer: boolean;
-        writable: boolean;
-      }>;
-      instructions: ParsedInstruction[];
-    };
-  };
-}
-
-interface PendingTransaction {
-  signature: string;
-  logs: string[];
-  attempts: number;
-  firstSeen: number;
+  timestamp: number;
 }
 
 export class SolanaMonitor {
   private ws: WebSocket | null = null;
   private rpcUrl: string;
   private rpcKey: string;
-  private processedSignatures: Set<string> = new Set();
   private onNewTokenCallback: ((tokenData: TokenData) => void) | null = null;
-  private pendingTransactions: Map<string, PendingTransaction> = new Map();
-  private processingInterval: NodeJS.Timeout | null = null;
-  private lastQueueSaturatedLog: number = 0;
+  
+  // Protection anti-flood : Set de signatures déjà traitées
+  private processedSignatures: Set<string> = new Set();
+  
+  // Cache des logs récents pour éviter les doublons Helius (100ms de fenêtre)
+  private recentLogs: Map<string, ProcessedLog> = new Map();
+  private readonly DEDUP_WINDOW_MS = 100;
 
   constructor(solana: SolanaConfig) {
     this.rpcUrl = solana.rpcUrl;
-    this.rpcKey = (solana.rpcKey || '');
+    this.rpcKey = solana.rpcKey || '';
   }
 
   private prepareRpcHeaders(): Record<string, string> {
@@ -106,7 +69,7 @@ export class SolanaMonitor {
         this.ws = new WebSocket(wsUrl);
 
         this.ws.on('open', () => {
-          console.log('✅ WebSocket Helius connecté');
+          console.log('✅ WebSocket Helius connecté (mode Zéro Appel RPC)');
           
           const subscribeBondingCurve = {
             jsonrpc: '2.0',
@@ -131,7 +94,7 @@ export class SolanaMonitor {
           if (this.ws) {
             this.ws.send(JSON.stringify(subscribeBondingCurve));
             this.ws.send(JSON.stringify(subscribeMayhem));
-            console.log(`📡 Surveillance des logs activée...`);
+            console.log('📡 Surveillance des logs activée (extraction textuelle uniquement)');
           }
           resolve();
         });
@@ -139,9 +102,23 @@ export class SolanaMonitor {
         this.ws.on('message', (data: WebSocket.Data) => {
           try {
             const message = JSON.parse(data.toString());
+            
+            // Gérer les réponses aux subscriptions (id: 1 ou 2)
+            if (message && typeof message === 'object' && 'id' in message) {
+              const msg = message as { id: number; result?: unknown; error?: unknown };
+              if (msg.id === 1 || msg.id === 2) {
+                if (msg.result) {
+                  console.log(`✅ Subscription ${msg.id} active, ID: ${msg.result}`);
+                } else if (msg.error) {
+                  console.error(`❌ Erreur subscription ${msg.id}:`, msg.error);
+                }
+                return; // Ne pas traiter les réponses de subscription comme des notifications
+              }
+            }
+            
             this.handleMessage(message);
           } catch (error) {
-            // Silence
+            console.error('❌ Erreur parsing message WebSocket:', error);
           }
         });
 
@@ -166,7 +143,9 @@ export class SolanaMonitor {
     if (!message || typeof message !== 'object') return;
     const msg = message as Record<string, unknown>;
 
-    if (msg['method'] === 'logsNotification') {
+    if (msg['method']) {
+      const method = msg['method'] as string;
+      if (method === 'logsNotification') {
       const params = msg['params'] as Record<string, unknown>;
       const value = params['result'] as Record<string, unknown> | undefined;
       const resultValue = value?.['value'] as Record<string, unknown> | undefined;
@@ -175,150 +154,441 @@ export class SolanaMonitor {
         const signature = resultValue['signature'] as string;
         const logs = resultValue['logs'] as string[];
 
-        if (signature && !this.processedSignatures.has(signature)) {
-          this.processedSignatures.add(signature);
-          // Nettoyer le cache périodiquement pour éviter les fuites mémoire
-          if (this.processedSignatures.size > 10000) {
-            this.processedSignatures.clear();
+          if (signature && logs && Array.isArray(logs)) {
+            // Log temporaire pour debug : voir si des logs arrivent
+            const hasPumpFun = logs.some(log => 
+              log.includes(PUMP_FUN_BONDING_CURVE) || 
+              log.includes(MAYHEM_PROGRAM_ID) ||
+              log.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P')
+            );
+            
+            if (hasPumpFun) {
+              console.log(`\n📥 Logs pump.fun reçus (${logs.length} lignes, sig: ${signature.substring(0, 8)}...)`);
           }
           
-          this.processLogs(signature, logs);
+          this.processLogs(signature, logs).catch(() => {
+            // Erreur silencieuse pour ne pas crasher le WebSocket
+          });
+        }
         }
       }
     }
   }
 
+  /**
+   * Traite les logs directement sans aucun appel RPC
+   * Protection anti-flood intégrée
+   * Fallback RPC si name/symbol OK mais mint manquant
+   */
   private async processLogs(signature: string, logs: string[]): Promise<void> {
-    // Vérification de la file d'attente : si saturée (>20), ignorer les nouveaux tokens
-    if (this.pendingTransactions.size > 20) {
-      // Log unique pour éviter le spam (une seule fois toutes les 10 secondes)
+    // Protection anti-flood : Vérifier si on a déjà traité cette signature récemment
       const now = Date.now();
-      if (!this.lastQueueSaturatedLog || now - this.lastQueueSaturatedLog > 10000) {
-        console.log('⚠️ File d\'attente saturée (20+), nouveaux tokens ignorés temporairement.');
-        this.lastQueueSaturatedLog = now;
-      }
+    const recentLog = this.recentLogs.get(signature);
+    
+    if (recentLog && (now - recentLog.timestamp) < this.DEDUP_WINDOW_MS) {
+      // Doublon détecté dans la fenêtre de 100ms, ignorer
       return;
     }
 
+    // Mettre à jour le cache
+    this.recentLogs.set(signature, { signature, timestamp: now });
+    
+    // Nettoyer le cache des logs anciens (>1 seconde)
+    if (this.recentLogs.size > 1000) {
+      for (const [sig, log] of this.recentLogs.entries()) {
+        if (now - log.timestamp > 1000) {
+          this.recentLogs.delete(sig);
+        }
+      }
+    }
+
+    // Vérifier si c'est une création de token
     const isCreation = logs.some(log => 
+      log.includes('Program log: Create') || 
       log.includes('Program log: Instruction: Create') || 
-      log.includes('Program 6EF8rrecthR5DkZJvT6uS8z6yL7GV8S7Zf4m1G8m7f23 invoke') ||
-      /Program.*invoke.*create/i.test(log) ||
-      /Program.*invoke.*create_v2/i.test(log)
+      log.includes('Program log: Instruction: CreateV2') ||
+      log.includes('Create:') ||
+      /Program.*log.*[Cc]reate/i.test(log)
     );
 
-    if (!isCreation) return;
-
-    console.log(`\n🎯 CRÉATION DE TOKEN DÉTECTÉE dans les logs !`);
-    console.log(`   Signature: ${signature.substring(0, 16)}...`);
-
-    this.pendingTransactions.set(signature, {
-      signature,
-      logs,
-      attempts: 0,
-      firstSeen: Date.now(),
-    });
-
-    if (!this.processingInterval) {
-      this.startProcessingQueue();
-    }
-  }
-
-  private startProcessingQueue(): void {
-    this.processingInterval = setInterval(() => {
-      this.processPendingTransactions();
-    }, 1000); // 1 tick par seconde pour lisser la charge
-  }
-
-  private async processPendingTransactions(): Promise<void> {
-    const now = Date.now();
-    let processedCount = 0; // Compteur pour limiter à 3 par tick
-
-    for (const [signature, pending] of this.pendingTransactions.entries()) {
-      // Queue Throttling : Max 3 transactions par tick
-      if (processedCount >= 3) break;
-
-      // Supprimer les transactions trop anciennes (45 secondes)
-      if (now - pending.firstSeen > 45000) {
-        this.pendingTransactions.delete(signature);
-        continue;
-      }
-      
-      // Supprimer après 8 tentatives
-      if (pending.attempts >= 8) {
-        this.pendingTransactions.delete(signature);
-        continue;
-      }
-
-      await this.processPendingTransaction(signature);
-      processedCount++;
-    }
-  }
-
-  private async processPendingTransaction(signature: string): Promise<void> {
-    const pending = this.pendingTransactions.get(signature);
-    if (!pending) return;
-
-    pending.attempts++;
-    
-    // Backoff Intelligent : attendre attempt * 1000ms avant de réessayer
-    if (pending.attempts > 1) {
-      const backoff = pending.attempts * 1000;
-      const timeSinceFirstSeen = Date.now() - pending.firstSeen;
-      if (timeSinceFirstSeen < backoff) {
-        return; // Pas encore le moment de réessayer
-      }
-    }
-
-    try {
-      const transaction = await this.getTransaction(signature);
-      
-      if (!transaction) {
-        return; // Réessayera au prochain tick
-      }
-
-      if (transaction.meta?.err) {
-        console.log(`   ⚠️  Transaction échouée, ignorée`);
-        this.pendingTransactions.delete(signature);
+    if (!isCreation) {
         return;
       }
 
-      console.log(`   ✅ Transaction récupérée (slot: ${transaction.slot})`);
+    console.log(`   🔍 Création détectée, extraction des métadonnées...`);
 
-      // LAZY LOADING STRICT : Extraction UNIQUEMENT depuis les logs (pas d'appel RPC)
-      const tokenData = this.extractTokenData(transaction);
-      
-      if (tokenData && tokenData.address) {
-        console.log(`   ✅ Mint address trouvé: ${tokenData.address}`);
-        
-        // Si le nom est "Unknown", on ignore le token (pas de quarantaine)
-        if (!tokenData.metadata?.name || tokenData.metadata.name === 'Unknown') {
-          console.log(`   ⏭️  Token ignoré (nom non trouvé dans les logs)`);
-          this.pendingTransactions.delete(signature);
+    // Extraction purement textuelle via regex
+    const parsed = this.extractTokenDataFromLogs(logs);
+    
+    if (!parsed) {
+      // Parsing échoué -> Ignorer le token (règle stricte)
+      console.log(`   ⚠️  Échec extraction des métadonnées`);
           return;
         }
         
-        console.log(`   ✅ Métadonnées trouvées dans les logs: ${tokenData.metadata.name}, ${tokenData.metadata.symbol || 'N/A'}`);
-        
-        // Envoyer le token à la quarantaine (index.ts se chargera de l'enrichissement après 30s)
-        if (this.onNewTokenCallback) {
-          this.onNewTokenCallback(tokenData);
+    // SAUVETAGE : Si name et symbol sont OK mais mint manquant, récupérer via RPC
+    let mintAddress: string | null = parsed.mint;
+    if (!mintAddress && parsed.name && parsed.symbol) {
+      console.log(`   🔄 Mint manquant, tentative de récupération via RPC...`);
+      try {
+        const recoveredMint = await this.recoverMintFromTransaction(signature);
+        if (recoveredMint) {
+          mintAddress = recoveredMint;
+          console.log(`   ✅ Mint récupéré via RPC: ${mintAddress.substring(0, 16)}...`);
+        } else {
+          console.log(`   ⚠️  Impossible de récupérer le mint via RPC`);
+          return; // On ignore le token si on ne peut pas récupérer le mint
         }
-
-        this.pendingTransactions.delete(signature);
-      } else {
-        console.log(`   ⚠️  Mint address non trouvé dans la transaction`);
+      } catch (error) {
+        console.log(`   ⚠️  Erreur lors de la récupération du mint via RPC`);
+        return;
       }
-    } catch (error) {
-      // Silent fail - réessayera au prochain tick
+    }
+
+    // Validation finale : on doit avoir un mint valide
+    if (!mintAddress) {
+      return;
+    }
+        
+    // Vérifier si on a déjà traité cette signature (protection supplémentaire)
+    if (this.processedSignatures.has(signature)) {
+      return;
+    }
+    
+    this.processedSignatures.add(signature);
+    
+    // Nettoyer le cache périodiquement pour éviter les fuites mémoire
+    if (this.processedSignatures.size > 10000) {
+      this.processedSignatures.clear();
+    }
+
+    console.log(`\n🎯 TOKEN DÉTECTÉ (extraction textuelle)`);
+    console.log(`   Signature: ${signature.substring(0, 16)}...`);
+    console.log(`   Mint: ${mintAddress.substring(0, 16)}...`);
+    console.log(`   Name: ${parsed.name}, Symbol: ${parsed.symbol}`);
+
+    // Construire le TokenData minimal
+    const tokenData: TokenData = {
+      address: mintAddress,
+      metadata: {
+        name: parsed.name,
+        symbol: parsed.symbol,
+        ...(parsed.uri ? { image: parsed.uri } : {}),
+      },
+      // reserves sera récupéré plus tard par la quarantaine
+    };
+
+    // Envoyer le token au callback (quarantaine)
+    if (this.onNewTokenCallback) {
+      // Petit délai pour éviter le flood (100ms)
+      setTimeout(() => {
+        this.onNewTokenCallback?.(tokenData);
+      }, 100);
     }
   }
 
-  private async getTransaction(signature: string): Promise<SolanaTransaction | null> {
+  /**
+   * Extrait les données du token UNIQUEMENT depuis les logs avec des regex
+   * ZÉRO APPEL RPC - Si le parsing échoue, retourne null (on ignore le token)
+   * Les métadonnées sont dans les "Program data" en base64
+   */
+  private extractTokenDataFromLogs(logs: string[]): ParsedTokenLog | null {
     try {
-      // Utiliser rate limiting pour éviter les erreurs 429
-      const response = await rpcRateLimiter.execute(async () => {
-        return await axios.post(
+      let mint: string | null = null;
+      let name: string | null = null;
+      let symbol: string | null = null;
+      let uri: string | null = null;
+
+      // STRATÉGIE 1: Décoder les "Program data" en base64 (format Token Metadata)
+      // Les métadonnées sont dans les logs "Program data: [base64]"
+      let programDataCount = 0;
+      for (const log of logs) {
+        if (log.startsWith('Program data: ')) {
+          programDataCount++;
+          const base64Data = log.substring('Program data: '.length).trim();
+          try {
+            const decoded = this.decodeTokenMetadata(base64Data);
+            if (decoded) {
+              if (decoded.mint && !mint) mint = decoded.mint;
+              if (decoded.name && !name) name = decoded.name || null;
+              if (decoded.symbol && !symbol) symbol = decoded.symbol || null;
+              if (decoded.uri && !uri) uri = decoded.uri || null;
+            }
+          } catch (error) {
+            // Ignorer les erreurs de décodage
+          }
+        }
+      }
+      
+      // Debug : voir combien de Program data on a trouvé
+      if (programDataCount > 0) {
+        console.log(`   📊 ${programDataCount} "Program data" trouvé(s), mint: ${mint ? '✓' : '✗'}, name: ${name ? '✓' : '✗'}, symbol: ${symbol ? '✓' : '✗'}`);
+      }
+
+      // STRATÉGIE 2: Recherche textuelle dans les logs (fallback)
+      const logsText = logs.join('\n');
+      
+      // Pattern compact "Create: mint: [ADDR], name: [NAME], symbol: [SYM], uri: [URI]" (regex améliorée)
+      const compactPattern = /[Cc]reate:\s*mint\s*[=:]\s*([1-9A-HJ-NP-Za-km-z]{32,44}),\s*name\s*[=:]\s*([^,\n}]+?),\s*symbol\s*[=:]\s*([^,\n}]+?)(?:,\s*uri\s*[=:]\s*([^\n}]+))?/i;
+      const compactMatch = logsText.match(compactPattern);
+      if (compactMatch) {
+        if (!mint) mint = compactMatch[1]?.trim() || null;
+        if (!name) name = compactMatch[2]?.trim().replace(/['"]/g, '') || null;
+        if (!symbol) symbol = compactMatch[3]?.trim().replace(/['"]/g, '') || null;
+        if (!uri) uri = compactMatch[4]?.trim().replace(/['"]/g, '') || null;
+      }
+
+      // Pattern multi-lignes (regex améliorée avec espaces flexibles)
+      if (!mint || !name || !symbol) {
+        const multilinePattern = /mint\s*[=:]\s*([1-9A-HJ-NP-Za-km-z]{32,44})|name\s*[=:]\s*([^,\n}]+?)|symbol\s*[=:]\s*([^,\n}]+?)|uri\s*[=:]\s*([^\n}]+)/gi;
+        const matches = Array.from(logsText.matchAll(multilinePattern));
+        for (const match of matches) {
+          if (match[1] && !mint) mint = match[1].trim();
+          if (match[2] && !name) name = match[2].trim().replace(/['"]/g, '');
+          if (match[3] && !symbol) symbol = match[3].trim().replace(/['"]/g, '');
+          if (match[4] && !uri) uri = match[4].trim().replace(/['"]/g, '');
+        }
+      }
+
+      // STRATÉGIE 3: Chercher le mint dans les adresses de programmes invoqués
+      // Le mint est souvent dans les account keys, mais on n'a pas accès ici
+      // On peut essayer de trouver des patterns d'adresses Solana dans les logs
+      if (!mint) {
+        // Chercher des adresses Solana valides dans les logs (exactement 32-44 caractères base58)
+        // Les adresses Solana valides sont en base58, donc pas de 0, O, I, l
+        const addressPattern = /\b([1-9A-HJ-NP-Za-km-z]{32,44})\b/g;
+        const addresses = Array.from(logsText.matchAll(addressPattern));
+        // Filtrer les adresses connues (programmes système)
+        const knownPrograms = [
+          '11111111111111111111111111111111',
+          'ComputeBudget111111111111111111111111111111',
+          'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+          'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+          '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+          'pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ', // Programme de fees
+          PUMP_FUN_BONDING_CURVE,
+          MAYHEM_PROGRAM_ID,
+        ];
+        for (const match of addresses) {
+          const addr = match[1];
+          if (addr && !knownPrograms.includes(addr)) {
+            // Valider que c'est une adresse Solana valide (base58, 32-44 chars)
+            // Les adresses Solana standard font généralement 32 ou 44 caractères
+            if ((addr.length === 32 || addr.length === 43 || addr.length === 44) && 
+                /^[1-9A-HJ-NP-Za-km-z]+$/.test(addr)) {
+              // Vérifier que ce n'est pas un pattern suspect (trop de caractères répétés)
+              const uniqueChars = new Set(addr).size;
+              if (uniqueChars > 10) { // Au moins 10 caractères différents
+                mint = addr;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Validation : name et symbol sont obligatoires, mint peut être null (sera récupéré via RPC)
+      if (!name || !symbol) {
+        return null; // Parsing échoué -> Ignorer le token
+      }
+
+      // Validation du format de l'adresse mint si elle existe
+      if (mint) {
+        // Les adresses Solana valides sont en base58 (pas de 0, O, I, l) et font généralement 32, 43 ou 44 caractères
+        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) || 
+            (mint.length !== 32 && mint.length !== 43 && mint.length !== 44)) {
+          mint = null; // Adresse invalide, on essaiera de la récupérer via RPC
+        }
+      }
+      
+      // Filtrer les noms/symboles suspects (artefacts de parsing)
+      // "cv" semble être un artefact commun
+      if (name.length <= 2 && (name === 'cv' || name === 'qu' || name === '4l')) {
+        return null; // Probablement un artefact
+      }
+
+      // Nettoyage des valeurs
+      name = name.trim();
+      symbol = symbol.trim();
+      uri = uri?.trim() || null;
+
+      // Filtrer les tokens de mauvaise qualité
+      const nameLower = name.toLowerCase();
+      const symbolLower = symbol.toLowerCase();
+      
+      // Mots interdits
+      const blacklistWords = ['test', 'shit', 'pump'];
+      const hasBlacklistedWord = blacklistWords.some(word => 
+        nameLower.includes(word) || symbolLower.includes(word)
+      );
+      
+      // "coin" seul
+      const isCoinAlone = nameLower === 'coin' || symbolLower === 'coin' ||
+        /\bcoin\b/.test(nameLower) || /\bcoin\b/.test(symbolLower);
+      
+      // Caractères uniquement chinois/russes (sans ASCII)
+      const cjkCyrillicRegex = /^[\u4e00-\u9fff\u0400-\u04ff\s]+$/;
+      const isOnlyCjkCyrillic = cjkCyrillicRegex.test(name) && name.length > 0;
+      
+      if (hasBlacklistedWord || isCoinAlone || isOnlyCjkCyrillic) {
+        return null; // Ignorer le token
+      }
+
+      return {
+        mint,
+        name,
+        symbol,
+        uri: uri || '',
+      };
+    } catch (error) {
+      // Erreur de parsing -> Ignorer le token
+      return null;
+    }
+  }
+
+  /**
+   * Décode les métadonnées de token depuis les données base64
+   * Format Token Metadata Standard de Solana
+   * 
+   * NOTE: Le format exact peut varier. On essaie plusieurs offsets possibles.
+   */
+  private decodeTokenMetadata(base64Data: string): { mint?: string; name?: string; symbol?: string; uri?: string } | null {
+    try {
+      const buffer = Buffer.from(base64Data, 'base64');
+      
+      if (buffer.length < 10) return null; // Trop court
+
+      // FORMAT 1: Token Metadata Standard (offset 33-65 = mint)
+      // Offset 0-1: discriminator (1 byte)
+      // Offset 1-33: update authority (32 bytes)
+      // Offset 33-65: mint (32 bytes)
+      // Offset 65-69: name length (u32, 4 bytes)
+      
+      if (buffer.length >= 69) {
+        try {
+          // Extraire le mint (32 bytes à l'offset 33)
+          const mintBytes = buffer.slice(33, 65);
+          let mintAddress: string | null = null;
+          
+          try {
+            const publicKey = new PublicKey(mintBytes);
+            mintAddress = publicKey.toBase58();
+          } catch (error) {
+            // Mint invalide, on continue quand même
+          }
+          
+          let offset = 65;
+          
+          // Lire name
+          if (offset + 4 <= buffer.length) {
+            const nameLength = buffer.readUInt32LE(offset);
+            offset += 4;
+            if (offset + nameLength <= buffer.length && nameLength > 0 && nameLength < 1000) {
+              const nameBytes = buffer.slice(offset, offset + nameLength);
+              const nameStr = nameBytes.toString('utf8').replace(/\0/g, '').trim();
+              if (nameStr.length > 0 && /^[\x20-\x7E]+$/.test(nameStr)) { // ASCII printable seulement
+                offset += nameLength;
+                
+                // Lire symbol
+                if (offset + 4 <= buffer.length) {
+                  const symbolLength = buffer.readUInt32LE(offset);
+                  offset += 4;
+                  if (offset + symbolLength <= buffer.length && symbolLength > 0 && symbolLength < 100) {
+                    const symbolBytes = buffer.slice(offset, offset + symbolLength);
+                    const symbolStr = symbolBytes.toString('utf8').replace(/\0/g, '').trim();
+                    if (symbolStr.length > 0 && /^[\x20-\x7E]+$/.test(symbolStr)) {
+                      offset += symbolLength;
+                      
+                      // Lire uri
+                      let uriStr: string | undefined;
+                      if (offset + 4 <= buffer.length) {
+                        const uriLength = buffer.readUInt32LE(offset);
+                        offset += 4;
+                        if (offset + uriLength <= buffer.length && uriLength > 0 && uriLength < 500) {
+                          const uriBytes = buffer.slice(offset, offset + uriLength);
+                          uriStr = uriBytes.toString('utf8').replace(/\0/g, '').trim();
+                        }
+                      }
+                      
+                      // Si on a au moins name et symbol, c'est valide
+                      if (nameStr && symbolStr) {
+                        return {
+                          mint: mintAddress || undefined,
+                          name: nameStr,
+                          symbol: symbolStr,
+                          uri: uriStr,
+                        };
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (error) {
+          // Format 1 échoué, on essaie le format 2
+        }
+      }
+
+      // FORMAT 2: Recherche de chaînes UTF-8 valides dans le buffer
+      // Parfois les métadonnées sont directement lisibles
+      try {
+        // Chercher des patterns comme des noms/symboles valides
+        // Format possible: texte lisible suivi de null bytes
+        const readableParts: string[] = [];
+        let currentPart = '';
+        
+        for (let i = 0; i < Math.min(buffer.length, 500); i++) {
+          const char = buffer[i];
+          if (char !== undefined && char >= 32 && char <= 126) { // ASCII printable
+            currentPart += String.fromCharCode(char);
+          } else {
+            if (currentPart.length >= 2 && currentPart.length <= 50) {
+              readableParts.push(currentPart);
+            }
+            currentPart = '';
+          }
+        }
+        
+        // Prendre les 2-3 premières chaînes valides comme name/symbol
+        // Filtrer les artefacts courts comme "cv", "qu", etc.
+        const validParts = readableParts.filter(part => {
+          const trimmed = part.trim();
+          return trimmed.length >= 3 && // Au moins 3 caractères
+                 trimmed !== 'cv' && 
+                 trimmed !== 'qu' && 
+                 trimmed !== '4l' &&
+                 /^[\x20-\x7E]+$/.test(trimmed); // ASCII printable seulement
+        });
+        
+        if (validParts.length >= 2) {
+          const name = validParts[0]?.trim();
+          const symbol = validParts[1]?.trim();
+          
+          if (name && symbol && name.length >= 3 && name.length <= 50 && symbol.length >= 1 && symbol.length <= 20) {
+            return {
+              name,
+              symbol,
+            };
+          }
+        }
+      } catch (error) {
+        // Format 2 échoué
+      }
+      
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Récupère le mint depuis la transaction via RPC (fallback de sauvetage)
+   * Extrait le mint depuis postTokenBalances
+   */
+  private async recoverMintFromTransaction(signature: string): Promise<string | null> {
+    try {
+      const response = await axios.post(
           this.rpcUrl,
           {
             jsonrpc: '2.0',
@@ -335,173 +605,43 @@ export class SolanaMonitor {
           },
           { headers: this.prepareRpcHeaders(), timeout: 5000 }
         );
-      });
 
-      const result = response.data?.result as SolanaTransaction | null;
-      
-      // Si pas de résultat, vérifier s'il y a une erreur
-      if (!result && response.data?.error) {
-        const error = response.data.error as { code?: number; message?: string };
-        // Ne pas logger les erreurs -32602 (Invalid params) ou -32004 (Transaction not found)
-        // car c'est normal si la transaction est trop récente
-        if (error.code !== -32602 && error.code !== -32004) {
-          // Silent - évite le spam
-        }
-      }
-      
-      return result;
-    } catch (error) {
-      // Gérer les erreurs 429 avec pause globale (géré par le rate limiter)
-      if (axios.isAxiosError(error) && error.response?.status === 429) {
-        rpcRateLimiter.handle429();
-        // Silent - le rate limiter gère déjà le logging discret
-      }
+      const transaction = response.data?.result;
+      if (!transaction || transaction.meta?.err) {
       return null;
-    }
-  }
-
-  /**
-   * Extrait les données du token UNIQUEMENT depuis les logs de la transaction
-   * LAZY LOADING STRICT : Aucun appel RPC, aucune requête HTTP
-   * @param transaction - Transaction Solana
-   * @returns TokenData ou null si le nom est "Unknown"
-   */
-  private extractTokenData(transaction: SolanaTransaction): TokenData | null {
-    try {
-      let mintAddress: string | null = null;
-      let name: string | undefined = undefined;
-      let symbol: string | undefined = undefined;
-      let uri: string | undefined = undefined;
-
-      // Stratégie 1: postTokenBalances (le plus fiable)
-      if (transaction.meta.postTokenBalances) {
-        const newMint = transaction.meta.postTokenBalances.find(bal => 
-            bal.uiTokenAmount?.decimals === 6 && 
-            bal.uiTokenAmount?.uiAmount !== null
-        );
-        if (newMint) mintAddress = newMint.mint;
-      }
-      
-      // Stratégie 2: AccountKeys (fallback)
-      if (!mintAddress && transaction.transaction.message.accountKeys) {
-         const accounts = transaction.transaction.message.accountKeys;
-         for (let i = 0; i < Math.min(accounts.length, 5); i++) {
-             const acc = accounts[i];
-             if (acc && !acc.signer && acc.writable && typeof acc.pubkey === 'string') {
-                 // Exclure les programmes système
-                 if (!acc.pubkey.startsWith('111111') && !acc.pubkey.startsWith('TokenkegQ')) {
-                   mintAddress = acc.pubkey;
-                   break;
-                 }
-             }
-         }
       }
 
-      if (!mintAddress) return null;
-
-      // PRIORITÉ AUX LOGS : Extraire name/symbol/uri UNIQUEMENT depuis les logs
-      const logs = transaction.meta.logMessages || [];
-      for (const log of logs) {
-          // Chercher les patterns de métadonnées dans les logs
-          if (log.includes('name:') || log.includes('symbol:') || log.includes('Name:') || log.includes('Symbol:') || log.includes('uri:') || log.includes('URI:')) {
-              // Pattern 1: "name: X, symbol: Y, uri: Z"
-              const nameMatch = log.match(/name:\s*([^,\s}]+)/i) || log.match(/Name:\s*([^,\s}]+)/i);
-              const symbolMatch = log.match(/symbol:\s*([^,\s}]+)/i) || log.match(/Symbol:\s*([^,\s}]+)/i);
-              const uriMatch = log.match(/uri:\s*([^,\s}]+)/i) || log.match(/URI:\s*([^,\s}]+)/i);
-              
-              if (nameMatch && nameMatch[1]) name = nameMatch[1].trim().replace(/['"]/g, '');
-              if (symbolMatch && symbolMatch[1]) symbol = symbolMatch[1].trim().replace(/['"]/g, '');
-              if (uriMatch && uriMatch[1]) uri = uriMatch[1].trim().replace(/['"]/g, '');
-          }
-      }
-
-      // Fallback : Chercher dans les instructions parsées (si pas trouvé dans les logs)
-      if ((!name || !symbol) && transaction.transaction.message.instructions) {
-        for (const inst of transaction.transaction.message.instructions) {
-          if (inst?.parsed?.info) {
-            const info = inst.parsed.info as Record<string, unknown>;
-            if (!name && info['name']) name = String(info['name']);
-            if (!symbol && info['symbol']) symbol = String(info['symbol']);
-            if (!uri && info['uri']) uri = String(info['uri']);
-          }
-        }
-      }
-
-      // Fallback : Chercher dans les innerInstructions (si pas trouvé dans les logs)
-      if ((!name || !symbol || !uri) && transaction.meta.innerInstructions) {
-        for (const inner of transaction.meta.innerInstructions) {
-          if (inner?.instructions) {
-            for (const inst of inner.instructions) {
-              if (inst?.parsed?.info) {
-                const info = inst.parsed.info as Record<string, unknown>;
-                if (!name && info?.['name']) name = String(info['name']);
-                if (!symbol && info?.['symbol']) symbol = String(info['symbol']);
-                if (!uri && info?.['uri']) uri = String(info['uri']);
-              }
+      // Extraire le mint depuis postTokenBalances
+      // Le mint est le compte qui a reçu une grosse quantité de tokens et qui n'est pas un programme
+      if (transaction.meta.postTokenBalances && Array.isArray(transaction.meta.postTokenBalances)) {
+        for (const balance of transaction.meta.postTokenBalances) {
+          if (balance.mint && 
+              balance.uiTokenAmount?.decimals === 6 && 
+              balance.uiTokenAmount?.uiAmount !== null &&
+              balance.uiTokenAmount?.uiAmount > 0) {
+            // Valider que c'est une adresse Solana valide
+            const mint = balance.mint as string;
+            if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) && 
+                (mint.length === 32 || mint.length === 43 || mint.length === 44)) {
+              return mint;
             }
           }
         }
       }
 
-      // FILTRAGE IMMÉDIAT : Si le nom est "Unknown", retourner null (on ignore le token)
-      if (!name || name === 'Unknown') {
         return null;
-      }
-
-      // FILTRAGE EN AMONT : Rejeter les tokens de mauvaise qualité avant la quarantaine
-      const nameLower = name.toLowerCase().trim();
-      const symbolLower = (symbol || '').toLowerCase().trim();
-      
-      // Mots interdits dans le nom ou le symbole (test, shit, pump)
-      const blacklistWords = ['test', 'shit', 'pump'];
-      const hasBlacklistedWord = blacklistWords.some(word => 
-        nameLower.includes(word) || symbolLower.includes(word)
-      );
-      
-      // "coin" seul (pas dans un autre mot comme "coinbase" ou "coincidence")
-      const isCoinAlone = nameLower === 'coin' || symbolLower === 'coin' ||
-        /\bcoin\b/.test(nameLower) || /\bcoin\b/.test(symbolLower);
-      
-      // Vérifier si le nom contient uniquement des caractères chinois/russes (pas d'ASCII)
-      // Regex pour détecter les caractères chinois (CJK) et cyrilliques
-      const cjkCyrillicRegex = /^[\u4e00-\u9fff\u0400-\u04ff\s]+$/;
-      const isOnlyCjkCyrillic = cjkCyrillicRegex.test(name) && name.length > 0;
-      
-      // Rejeter si :
-      // - Contient un mot blacklisté (test, shit, pump)
-      // - Nom ou symbole est "coin" seul
-      // - Nom composé uniquement de caractères chinois/russes (sans ASCII)
-      if (hasBlacklistedWord || isCoinAlone || isOnlyCjkCyrillic) {
-        return null; // Ignorer le token immédiatement
-      }
-
-      // Retourner les données minimales (sans réserves, sans métadonnées off-chain)
-      // La quarantaine (index.ts) se chargera de l'enrichissement après 30s
-      return {
-        address: mintAddress,
-        metadata: {
-          name: name,
-          symbol: symbol || 'Unknown',
-          ...(uri ? { image: uri } : {}), // Stocker l'URI comme image temporairement
-        },
-        reserves: undefined, // Sera récupéré par la quarantaine
-      };
     } catch (error) {
+      // Erreur silencieuse - on ne veut pas crasher le WebSocket
       return null;
     }
   }
 
-  /**
-   * NOTE: Cette méthode n'est plus utilisée (Lazy Loading strict)
-   * L'enrichissement est maintenant fait par la quarantaine (index.ts) après 30s
-   * Conservée pour référence mais ne sera jamais appelée
-   */
-  // private async enrichTokenData(mintAddress: string): Promise<TokenData | null> {
-  //   // Supprimée - l'enrichissement est fait par la quarantaine
-  // }
-
   stop(): void {
-    if (this.ws) this.ws.close();
-    if (this.processingInterval) clearInterval(this.processingInterval);
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.processedSignatures.clear();
+    this.recentLogs.clear();
   }
 }

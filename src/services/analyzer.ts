@@ -8,7 +8,7 @@
 import axios from 'axios';
 import type { HolderData } from './holderService.js';
 import { PUMP_CURVE_ADDRESS } from './holderService.js';
-import { analyzeTokenSemantics } from './aiService.js';
+import { analyzeTokenSentiment } from './aiService.js';
 
 /**
  * Informations sociales du token
@@ -55,7 +55,7 @@ export interface TokenData {
  */
 export interface TokenAnalysisResult {
   score: number; // Score de 0 à 100
-  isAlphaAlert: boolean; // True si score > 70
+  isAlphaAlert: boolean; // True si score > 75
   marketCap: number; // Market Cap calculé en USD
   bondingCurveProgress: number; // Progrès de la bonding curve (0-100)
   breakdown: {
@@ -64,6 +64,7 @@ export interface TokenAnalysisResult {
     antiRugScore: number;
     devHoldingPenalty: number;
     holdersScore: number; // Score de distribution des holders
+    velocityScore: number; // Bonus Vélocité basé sur logCount
   };
   reasons: string[]; // Raisons du score
 }
@@ -75,6 +76,7 @@ export interface ValidateTokenOptions {
   solPriceUsd?: number; // Prix du SOL en USD (si non fourni, sera récupéré via API)
   holders?: HolderData[]; // Liste des holders (si non fourni, sera récupéré via holderService)
   devAddress?: string; // Adresse officielle du développeur (pour exclure du check de concentration)
+  logCount?: number; // Nombre de transactions vues pendant la quarantaine (pour bonus Vélocité)
 }
 
 /**
@@ -88,9 +90,9 @@ const PUMP_FUN_TOTAL_SUPPLY = 1_000_000_000; // 1 milliard de tokens
 /**
  * Seuils financiers critiques (MODE "MOMENTUM / GEMS")
  */
-const MIN_MARKET_CAP = 4000; // Market Cap minimum : $4,000 USD (seuil minimal pour considérer le token vivant)
+const MIN_MARKET_CAP = 3000; // Market Cap minimum : $3,000 USD (seuil minimal pour considérer le token vivant)
 const MIN_HOLDERS = 7; // Nombre minimum de holders : 7 (preuve qu'il y a d'autres acheteurs que le dev)
-const ALPHA_ALERT_THRESHOLD = 70; // Seuil d'alerte Alpha : 70 points
+const ALPHA_ALERT_THRESHOLD = 75; // Seuil d'alerte Alpha : 75 points
 
 /**
  * Blacklist sémantique : Mots interdits dans le nom ou le symbole du token
@@ -271,21 +273,16 @@ function evaluateSocialPresenceMomentum(metadata?: TokenMetadata): { score: numb
   }
 
   const { twitter, telegram, website } = metadata.social;
-  let hasSocialNetwork = false;
+  const hasTwitter = twitter && isValidTwitterLink(twitter);
+  const hasTelegram = telegram && isValidTelegramLink(telegram);
 
-  // Au moins 1 réseau social (Twitter OU Telegram) : +20 pts
-  if (twitter && isValidTwitterLink(twitter)) {
-    score += 20;
-    hasSocialNetwork = true;
+  // Bonus Social Complet : Twitter ET Telegram = +15 pts
+  if (hasTwitter && hasTelegram) {
+    score += 15;
+    reasons.push(`✅ Twitter ET Telegram présents (+15 pts)`);
+  } else if (hasTwitter) {
     reasons.push(`✅ Twitter présent`);
-  }
-
-  if (telegram && isValidTelegramLink(telegram)) {
-    if (!hasSocialNetwork) {
-      // Si Twitter n'est pas présent, Telegram compte pour les 20 pts
-      score += 20;
-      hasSocialNetwork = true;
-    }
+  } else if (hasTelegram) {
     reasons.push(`✅ Telegram présent`);
   }
 
@@ -295,14 +292,14 @@ function evaluateSocialPresenceMomentum(metadata?: TokenMetadata): { score: numb
       const url = new URL(website);
       if (url.protocol === 'http:' || url.protocol === 'https:') {
         score += 10;
-        reasons.push(`✅ Website présent`);
+        reasons.push(`✅ Website présent (+10 pts)`);
       }
     } catch {
       // URL invalide, ignorer
     }
   }
 
-  if (!hasSocialNetwork) {
+  if (!hasTwitter && !hasTelegram) {
     reasons.push(`❌ Aucun réseau social valide (Twitter ou Telegram requis)`);
   }
 
@@ -404,20 +401,45 @@ export async function validateToken(
   const reasons: string[] = [];
   let totalScore = 0; // Base Score : 0
 
-  // Récupérer le prix du SOL
+  // FIX CRITIQUE DU PRIX SOL (Le Bug du Zéro) - Dès le début de la fonction
+  // Définir un prix SOL de secours
   let solPriceUsd = options.solPriceUsd;
-  if (!solPriceUsd) {
+  if (!solPriceUsd || solPriceUsd <= 0) {
     try {
       solPriceUsd = await fetchSolPrice();
+      // Si l'API retourne 0 ou invalide, utiliser le fallback
+      if (!solPriceUsd || solPriceUsd <= 0) {
+        solPriceUsd = 128.0;
+        reasons.push('⚠️ Prix SOL par défaut utilisé (API retourne 0)');
+      }
     } catch (error) {
       // Fallback sur un prix par défaut si l'API échoue
-      solPriceUsd = 100;
+      solPriceUsd = 128.0;
       reasons.push('⚠️ Prix SOL par défaut utilisé (API indisponible)');
     }
   }
 
-  // Calcul du Market Cap et de la Bonding Curve Progress
-  const marketCap = calculateMarketCap(token.reserves, solPriceUsd);
+  // Calcul du Market Cap avec le prix SOL corrigé
+  let marketCap = calculateMarketCap(token.reserves, solPriceUsd);
+  
+  // Recalcul du Market Cap si nécessaire (fallback basé sur les réserves)
+  // Garantir un MC minimum d'environ $3800 pour les courbes fraîchement créées
+  if (marketCap <= 0) {
+    // Utiliser vSolReserves si disponible, sinon fallback à 30 SOL (30000000000 lamports)
+    const vSolReserves = token.reserves?.vSolReserves || 30000000000;
+    // Calcul : (vSolReserves / 1e9) * solPriceUsd
+    marketCap = (vSolReserves / 1e9) * solPriceUsd;
+    
+    // Si toujours 0 ou trop faible, utiliser un fallback minimum (30 SOL * prix SOL)
+    // Cela garantit un MC d'environ $3800 minimum (30 * 128 = 3840)
+    if (marketCap <= 0 || marketCap < MIN_MARKET_CAP) {
+      marketCap = Math.max(30 * solPriceUsd, MIN_MARKET_CAP);
+      reasons.push(`📊 Market Cap fallback (curve vide): $${marketCap.toFixed(0)}`);
+    } else {
+      reasons.push(`📊 Market Cap estimé depuis réserves: $${marketCap.toFixed(0)}`);
+    }
+  }
+
   const progress = calculateBondingCurveProgress(token.reserves);
 
   // FILTRE ÉLIMINATOIRE 1 : Market Cap minimum
@@ -433,6 +455,7 @@ export async function validateToken(
         antiRugScore: 0,
         devHoldingPenalty: 0,
         holdersScore: 0,
+        velocityScore: 0,
       },
       reasons: [`❌ MC trop faible ($${marketCap.toFixed(0)} < $${MIN_MARKET_CAP.toLocaleString()})`],
     };
@@ -452,6 +475,7 @@ export async function validateToken(
         antiRugScore: 0,
         devHoldingPenalty: 0,
         holdersScore: 0,
+        velocityScore: 0,
       },
       reasons: [`❌ Pas assez de holders (${holders.length} < ${MIN_HOLDERS})`],
     };
@@ -474,6 +498,18 @@ export async function validateToken(
   totalScore += socialScore;
   reasons.push(...socialResult.reasons);
 
+  // BONUS VÉLOCITÉ (Le Facteur X) : Basé sur logCount
+  let velocityScore = 0;
+  const logCount = options.logCount ?? 0;
+  if (logCount > 50) {
+    velocityScore = 25;
+    reasons.push(`🚀 Vélocité EXCEPTIONNELLE: ${logCount} tx en 30s (+25 pts)`);
+  } else if (logCount > 20) {
+    velocityScore = 10;
+    reasons.push(`⚡ Vélocité élevée: ${logCount} tx en 30s (+10 pts)`);
+  }
+  totalScore += velocityScore;
+
   // SCORING "MOMENTUM" : Holders
   const holdersResult = evaluateHoldersMomentum(holders, options.devAddress);
   const holdersScore = holdersResult.score;
@@ -487,6 +523,52 @@ export async function validateToken(
   if (blacklistResult.reason) {
     reasons.push(blacklistResult.reason);
   }
+
+  // INTÉGRATION IA (Le Juge) : Analyse du potentiel viral
+  const tokenName = token.metadata?.name || '';
+  const tokenSymbol = token.metadata?.symbol || '';
+  let aiScore = 50; // Score neutre par défaut
+  let aiScoreModifier = 0;
+
+  try {
+    aiScore = await analyzeTokenSentiment(tokenName, tokenSymbol);
+    console.log(`🧠 AI Verdict: ${aiScore}/100`);
+    
+    // Logique de Sanction
+    if (aiScore <= 20) {
+      // Raciste/Spam : Score = 0, arrêt immédiat
+      return {
+        score: 0,
+        isAlphaAlert: false,
+        marketCap,
+        bondingCurveProgress: progress,
+        breakdown: {
+          socialScore: 0,
+          bondingCurveScore: 0,
+          antiRugScore: 0,
+          devHoldingPenalty: 0,
+          holdersScore: 0,
+          velocityScore: 0,
+        },
+        reasons: [`⛔ [IA] Nom Toxique/Spam (score: ${aiScore}/100)`],
+      };
+    } else if (aiScore >= 85) {
+      // Viral : Bonus +20 pts
+      aiScoreModifier = 20;
+      reasons.push(`🚀 [IA] Potentiel Viral détecté (score: ${aiScore}/100) (+20 pts)`);
+    } else {
+      // Score moyen : pas de bonus ni pénalité, juste log
+      reasons.push(`🧠 [IA] Score: ${aiScore}/100`);
+    }
+  } catch (error) {
+    // En cas d'erreur, continuer sans modifier le score (ne jamais bloquer le scanner)
+    // Log du score par défaut pour traçabilité
+    console.log(`🧠 AI Verdict: ${aiScore}/100 (fallback - erreur/timeout)`);
+    console.warn('[Analyzer] Erreur lors de l\'analyse IA sentiment:', error);
+    reasons.push('⚠️ [IA] Analyse sentiment indisponible');
+  }
+
+  totalScore += aiScoreModifier;
 
   // Évaluation anti-rug basique (nom + symbole + image)
   let antiRugScore = 0;
@@ -515,40 +597,14 @@ export async function validateToken(
     reasons.push(`🚨 Pénalité: Détention développeur trop élevée (${token.devHolding}% > 10%)`);
   }
 
-  // Analyse IA : UNIQUEMENT si le score est déjà élevé (économie de CPU)
-  let aiScoreModifier = 0;
-  if (totalScore > 50) {
-    try {
-      const aiResult = await analyzeTokenSemantics(
-        token.metadata?.name,
-        token.metadata?.symbol,
-        token.metadata?.description
-      );
-
-      if (aiResult.sentimentScore > 80) {
-        aiScoreModifier += 10;
-        reasons.push(`🤖 AI: Narratif '${aiResult.narrative}' détecté (sentiment: ${aiResult.sentimentScore})`);
-      } else if (aiResult.narrative && aiResult.narrative !== 'Unknown') {
-        reasons.push(`🤖 AI: Narratif '${aiResult.narrative}' détecté (sentiment: ${aiResult.sentimentScore})`);
-      }
-
-      if (aiResult.isLowEffort) {
-        aiScoreModifier -= 20;
-        reasons.push(`🚨 AI: Contenu faible effort détecté (${aiResult.riskLabel})`);
-      } else if (aiResult.riskLabel && aiResult.riskLabel !== 'Neutral') {
-        reasons.push(`⚠️ AI: Risque '${aiResult.riskLabel}' détecté`);
-      }
-    } catch (error) {
-      // En cas d'erreur, continuer sans modifier le score (ne jamais bloquer le scanner)
-      console.warn('[Analyzer] Erreur lors de l\'analyse IA:', error);
-    }
-  }
-  totalScore += aiScoreModifier;
-
   // Détermination si c'est une Alerte Alpha
   const isAlphaAlert = totalScore > ALPHA_ALERT_THRESHOLD;
   if (isAlphaAlert) {
-    reasons.push('🚨 ALERTE ALPHA DÉTECTÉE 🚨');
+    if (totalScore > 90) {
+      reasons.push('💎 ALERTE ALPHA MAXIMALE DÉTECTÉE 💎 (Top Tier / CopperInu Style)');
+    } else {
+      reasons.push('🚨 ALERTE ALPHA DÉTECTÉE 🚨');
+    }
   }
 
   return {
@@ -562,6 +618,7 @@ export async function validateToken(
       antiRugScore,
       devHoldingPenalty,
       holdersScore,
+      velocityScore,
     },
     reasons,
   };
