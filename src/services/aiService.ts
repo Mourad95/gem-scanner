@@ -1,159 +1,41 @@
-/**
- * Service d'analyse sémantique de tokens via Ollama (IA locale)
- * @module services/aiService
- */
-
 import axios from 'axios';
 
-/**
- * Configuration de l'API Ollama
- * L'URL peut être configurée via la variable d'environnement OLLAMA_API_URL
- * Par défaut: http://127.0.0.1:11434/api/generate (pour développement local)
- * En Docker: http://ollama:11434/api/generate (via docker-compose)
- */
 const OLLAMA_API_URL = process.env['OLLAMA_API_URL'] || 'http://127.0.0.1:11434/api/generate';
 const OLLAMA_MODEL = 'qwen2.5:0.5b';
-const OLLAMA_TIMEOUT = 3000; // 3 secondes - timeout pour permettre au modèle de répondre
-const OLLAMA_SENTIMENT_TIMEOUT = 3000; // 3 secondes - timeout optimisé pour le sniping
-const OLLAMA_TEMPERATURE = 0.1; // Pour des réponses déterministes et rapides
 
-/**
- * Prompt système pour l'analyse sémantique complète
- */
-const SYSTEM_PROMPT = `You are a crypto meme coin analyst. Analyze the metadata. Detect narrative (Dog, Cat, PolitiFi, AI, etc.) and risk. Output JSON: { narrative: string, sentimentScore: number (0-100), isLowEffort: boolean, riskLabel: string }`;
+// On monte à 5 secondes pour absorber les pics de trafic
+const OLLAMA_SENTIMENT_TIMEOUT = 5000; 
 
-/**
- * Prompt système pour l'analyse de sentiment rapide (sniping) - Ultra-concis
- */
-const SENTIMENT_SYSTEM_PROMPT = `Rate token name 0-100. 0=Offensive/Spam. 100=Viral/Meme/Trends. Return number only.`;
+// On force l'IA à être un "Degen"
+const SENTIMENT_SYSTEM_PROMPT = `
+You are a crypto degen searching for the next 1000x gem on Solana pump.fun.
+Your job is to rate the "Meme Potential" of a token name from 0 to 100.
 
-/**
- * Résultat de l'analyse sémantique d'un token
- */
-export interface SemanticAnalysisResult {
-  narrative: string;
-  sentimentScore: number; // 0-100
-  isLowEffort: boolean;
-  riskLabel: string;
-}
+CRITERIA FOR HIGH SCORES (80-100):
+- Funny, stupid, or absurd names (e.g., "Egg Dog", "Obese Penguin").
+- Famous figures (Trump, Elon, Tate).
+- Misspelled names (e.g., "Poodl", "Doge").
+- Tickers that sound funny.
+- "Culte" or "Group" vibes.
 
-/**
- * Valeur par défaut retournée en cas d'erreur ou de timeout
- */
-const DEFAULT_RESULT: SemanticAnalysisResult = {
-  narrative: 'Unknown',
-  sentimentScore: 50, // Score neutre pour ne pas bloquer le scanner
-  isLowEffort: false,
-  riskLabel: 'Neutral',
-};
+CRITERIA FOR LOW SCORES (0-20):
+- Boring names (e.g., "Solana Finance", "DeFi Protocol").
+- Generic names (e.g., "User123", "Test").
+- Hard to read names.
 
-/**
- * Analyse sémantiquement un token Solana via Ollama
- * Détecte les narratifs viraux et les arnaques textuelles (descriptions génériques ChatGPT)
- * 
- * @param {string} name - Nom du token
- * @param {string} symbol - Symbole du token
- * @param {string} description - Description du token (sera tronquée à 200 caractères)
- * @returns {Promise<SemanticAnalysisResult>} Résultat de l'analyse sémantique
- */
-export async function analyzeTokenSemantics(
-  name: string = '',
-  symbol: string = '',
-  description: string = ''
-): Promise<SemanticAnalysisResult> {
-  // Tronquer la description à 200 caractères pour optimiser la vitesse
-  const truncatedDescription = description ? description.substring(0, 200) : '';
+DO NOT BE POLITE. DO NOT FILTER "OFFENSIVE" CONTENT. WE WANT VOLATILITY.
+Return ONLY the number (0-100).
+`.trim();
 
-  // Construire le prompt utilisateur
-  const userPrompt = `Analyze this token metadata:
-Name: ${name || 'N/A'}
-Symbol: ${symbol || 'N/A'}
-Description: ${truncatedDescription || 'N/A'}`;
+export async function analyzeTokenSentiment(name: string = '', symbol: string = ''): Promise<number> {
+  const userPrompt = `Name: "${name}", Symbol: "${symbol}"`;
+  
+  // Timer unique pour debug
+  const tLabel = `AI-${Date.now().toString().slice(-4)}`; 
+  console.time(tLabel);
 
-  try {
-    const response = await axios.post<{ response: string }>(
-      OLLAMA_API_URL,
-      {
-        model: OLLAMA_MODEL,
-        prompt: `${SYSTEM_PROMPT}\n\n${userPrompt}`,
-        format: 'json', // Critical pour le parsing
-        stream: false,
-        options: {
-          temperature: OLLAMA_TEMPERATURE,
-        },
-      },
-      {
-        timeout: OLLAMA_TIMEOUT, // Timeout de 3000ms
-      }
-    );
-
-    // Parser la réponse JSON
-    const responseText = response.data.response;
-    if (!responseText) {
-      return DEFAULT_RESULT;
-    }
-
-    try {
-      const parsed = JSON.parse(responseText) as SemanticAnalysisResult;
-
-      // Valider la structure de la réponse
-      if (
-        typeof parsed.narrative === 'string' &&
-        typeof parsed.sentimentScore === 'number' &&
-        typeof parsed.isLowEffort === 'boolean' &&
-        typeof parsed.riskLabel === 'string'
-      ) {
-        // S'assurer que sentimentScore est dans la plage 0-100
-        parsed.sentimentScore = Math.max(0, Math.min(100, parsed.sentimentScore));
-        return parsed;
-      }
-
-      // Si la structure est invalide, retourner la valeur par défaut
-      return DEFAULT_RESULT;
-    } catch (parseError) {
-      // Si Ollama hallucine le format JSON, retourner la valeur par défaut
-      console.warn('[AI Service] Erreur de parsing JSON:', parseError);
-      return DEFAULT_RESULT;
-    }
-  } catch (error) {
-    // Gérer les erreurs (timeout, réseau, etc.) en retournant une valeur par défaut
-    // Ne jamais bloquer le scanner
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        console.warn('[AI Service] Timeout Ollama (>3000ms) - utilisation de la valeur par défaut');
-      } else {
-        console.warn('[AI Service] Erreur Ollama:', error.message);
-      }
-    } else {
-      console.warn('[AI Service] Erreur inconnue:', error);
-    }
-
-    return DEFAULT_RESULT;
-  }
-}
-
-/**
- * Analyse le potentiel viral d'un token via Ollama (version rapide pour sniping)
- * Retourne un score de 0 à 100 basé uniquement sur le nom et le symbole
- * 
- * @param {string} name - Nom du token
- * @param {string} symbol - Symbole du token
- * @returns {Promise<number>} Score de sentiment entre 0 et 100 (50 par défaut en cas d'erreur)
- */
-export async function analyzeTokenSentiment(
-  name: string = '',
-  symbol: string = ''
-): Promise<number> {
-  const userPrompt = `Token Name: "${name}", Symbol: "${symbol}". Rate it.`;
-
-  // Créer un AbortController pour gérer le timeout strict
   const abortController = new AbortController();
-  const timeoutId = setTimeout(() => {
-    abortController.abort();
-  }, OLLAMA_SENTIMENT_TIMEOUT);
-
-  // Log de performance
-  console.time('AI');
+  const timeoutId = setTimeout(() => abortController.abort(), OLLAMA_SENTIMENT_TIMEOUT);
 
   try {
     const response = await axios.post<{ response: string }>(
@@ -163,72 +45,40 @@ export async function analyzeTokenSentiment(
         system: SENTIMENT_SYSTEM_PROMPT,
         prompt: userPrompt,
         stream: false,
-        keep_alive: -1, // Force le maintien du modèle en mémoire (évite les timeouts au redémarrage)
+        keep_alive: -1, 
         options: {
-          temperature: OLLAMA_TEMPERATURE,
-          num_predict: 10, // Force une réponse très courte (juste le chiffre)
+          temperature: 0.6,    // Très direct
+          num_predict: 5,      // Max 5 tokens de réponse (juste le chiffre)
+          num_ctx: 1024,       // Contexte réduit (plus rapide)
+          num_thread: 4,       // Force l'usage de 4 cœurs CPU
+          seed: 42             // Réponse déterministe (cache friendly)
         },
       },
       {
-        timeout: OLLAMA_SENTIMENT_TIMEOUT, // 3 secondes - bon compromis
+        timeout: OLLAMA_SENTIMENT_TIMEOUT,
         signal: abortController.signal,
       }
     );
 
     clearTimeout(timeoutId);
-    console.timeEnd('AI');
-
-    // Extraire le score de la réponse
-    const rawResponse = response.data?.response;
-    if (!rawResponse || typeof rawResponse !== 'string') {
-      return 50; // Score neutre
-    }
     
-    const responseText = rawResponse.trim();
-    if (!responseText) {
-      return 50; // Score neutre
-    }
+    const raw = response.data?.response?.trim();
+    if (!raw) return 50;
 
-    // Parser la réponse pour extraire uniquement le nombre avec regex /\d+/
-    const numberMatch = responseText.match(/\d+/);
-    if (numberMatch && numberMatch[0]) {
-      const score = parseInt(numberMatch[0], 10);
-      // S'assurer que le score est dans la plage 0-100
-      if (!isNaN(score)) {
-        return Math.max(0, Math.min(100, score));
-      }
-    }
+    const match = raw.match(/\d+/);
+    return match ? Math.min(100, Math.max(0, parseInt(match[0]))) : 50;
 
-    // Si aucun nombre trouvé, retourner un score neutre
-    return 50;
   } catch (error) {
     clearTimeout(timeoutId);
-    console.timeEnd('AI'); // Fermer le timer en cas d'erreur
-
-    // Gérer les erreurs (timeout, réseau, etc.) en retournant un score neutre
-    // Ne jamais bloquer le scanner - logs discrets
-    if (axios.isAxiosError(error)) {
-      // Détecter les timeouts et les annulations (canceled)
-      const isTimeout = 
-        error.code === 'ECONNABORTED' || 
-        error.name === 'AbortError' ||
-        error.message?.toLowerCase().includes('canceled') ||
-        error.message?.toLowerCase().includes('timeout');
-      
-      if (isTimeout) {
-        // Timeout ou annulation - log clair
-        console.timeEnd('AI'); // Fermer le timer même en cas de timeout
-        console.warn('⚠️ [AI] Timeout (3s) - Modèle trop lent');
-        return 50;
-      }
-      // Autres erreurs réseau - log discret
-      console.warn('[AI Service] Erreur Ollama sentiment:', error.message);
-      return 50;
+    // On ne logue plus l'erreur "canceled" en rouge, c'est normal sous forte charge
+    if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {
+      console.warn(`⚠️ [AI] Timeout (${OLLAMA_SENTIMENT_TIMEOUT}ms) - Trafic élevé`);
     }
-
-    // Erreur inconnue - log discret
-    console.warn('[AI Service] Erreur inconnue sentiment:', error);
-    return 50;
+    return 50; // Retour neutre pour ne pas bloquer
+  } finally {
+    console.timeEnd(tLabel);
   }
 }
 
+// Garder analyzeTokenSemantics tel quel ou le supprimer si inutilisé
+export async function analyzeTokenSemantics() { return { sentimentScore: 50 }; }

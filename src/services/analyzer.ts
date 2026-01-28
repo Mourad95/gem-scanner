@@ -6,6 +6,7 @@
  */
 
 import axios from 'axios';
+import chalk from 'chalk';
 import type { HolderData } from './holderService.js';
 import { PUMP_CURVE_ADDRESS } from './holderService.js';
 import { analyzeTokenSentiment } from './aiService.js';
@@ -400,7 +401,9 @@ export async function validateToken(
 ): Promise<TokenAnalysisResult> {
   const reasons: string[] = [];
   let totalScore = 0; // Base Score : 0
-
+  
+  // Log de vérification pour confirmer que les modifications sont présentes
+  console.log(chalk.cyan(`🔍 [ANALYZER v2.1.0] Analyse de token: ${token.metadata?.name || 'N/A'} (${token.metadata?.symbol || 'N/A'})`));
   // FIX CRITIQUE DU PRIX SOL (Le Bug du Zéro) - Dès le début de la fonction
   // Définir un prix SOL de secours
   let solPriceUsd = options.solPriceUsd;
@@ -570,6 +573,68 @@ export async function validateToken(
 
   totalScore += aiScoreModifier;
 
+  // LOGIQUE STRICTE : Passage forcé uniquement si conditions EXCEPTIONNELLES réunies
+  // (Réduit drastiquement les faux positifs)
+  // Variable pour stocker si on doit forcer le score à 80 (après toutes les pénalités)
+  let shouldForceScore = false;
+  let forceScoreReason = '';
+  
+  if (socialScore === 0) {
+    if (aiScore >= 80) {
+      // 🕵️‍♂️ VÉRIFICATION 1 : Dev Holding
+      const devShare = token.devHolding || 0;
+      if (devShare > 20) {
+        const devPenalty = -100;
+        totalScore += devPenalty;
+        reasons.push(`⛔ DANGER: Narratif IA OK (${aiScore}), MAIS Dev détient ${devShare.toFixed(2)}% (>20%). Risque de Rug.`);
+      } else {
+        // 🕵️‍♂️ VÉRIFICATION 2 : Top 1 Holder (hors dev et curve)
+        const realHolders = holders.filter((h) => h.address !== PUMP_CURVE_ADDRESS);
+        const top1Holder = realHolders[0];
+        const top1Percentage = top1Holder?.percentage || 0;
+        const isTop1Dev = top1Holder?.address === options.devAddress;
+        
+        if (top1Percentage > 30 && !isTop1Dev) {
+          // Top 1 holder (non-dev) détient trop : RISQUE DE DUMP
+          const holderPenalty = -100;
+          totalScore += holderPenalty;
+          reasons.push(`⛔ DANGER: Narratif IA OK (${aiScore}), MAIS Top 1 wallet détient ${top1Percentage.toFixed(2)}% (>30%). Risque de dump.`);
+        } else {
+          // 🕵️‍♂️ VÉRIFICATION 3 : Bonding Curve
+          // Si score IA >= 95 : on ignore la curve (narratif EXCEPTIONNEL, token très récent OK)
+          // Si score IA < 95 : on exige que la curve ait progressé
+          if (progress <= 0 && aiScore < 95) {
+            // Curve encore vide ET score IA pas exceptionnel : token trop récent, risque élevé
+            const curvePenalty = -50;
+            totalScore += curvePenalty;
+            reasons.push(`⛔ DANGER: Narratif IA OK (${aiScore}), MAIS Bonding Curve à 0%. Token trop récent.`);
+          } else {
+            // ✅ TOUTES LES CONDITIONS SONT REMPLIES : Passage forcé
+            // Si score IA >= 95 : FORCER le score à 80 (narratif exceptionnel, early sniper)
+            // Si score IA >= 80 et < 95 : Ajouter un bonus modéré
+            if (aiScore >= 95) {
+              // Narratif EXCEPTIONNEL : On forcera le score à 80 APRÈS toutes les pénalités
+              shouldForceScore = true;
+              const curveInfo = progress > 0 ? `Curve: ${progress.toFixed(1)}%` : 'Curve: 0% (Early Sniper)';
+              forceScoreReason = `🚀 DEGEN ALERT: Narratif EXCEPTIONNEL (AI: ${aiScore}/100), Dev Clean (${devShare.toFixed(2)}%), Top 1: ${top1Percentage.toFixed(2)}%, ${curveInfo}. Score FORCÉ à 80 (Early Sniper).`;
+            } else {
+              // Narratif validé mais pas exceptionnel : Bonus modéré
+              const earlySniperBonus = 15;
+              totalScore += earlySniperBonus;
+              const curveInfo = progress > 0 ? `Curve: ${progress.toFixed(1)}%` : 'Curve: 0% (Token récent)';
+              reasons.push(`🚀 DEGEN ALERT: Narratif Validé (AI: ${aiScore}/100), Dev Clean (${devShare.toFixed(2)}%), Top 1: ${top1Percentage.toFixed(2)}%, ${curveInfo}. Bonus Early Sniper (+${earlySniperBonus} pts).`);
+            }
+          }
+        }
+      }
+    } else {
+      // Pas de socials ET narratif insuffisant
+      const noSocialsPenalty = -100;
+      totalScore += noSocialsPenalty;
+      reasons.push(`⛔ Pas de Socials et Narratif insuffisant (AI: ${aiScore}/100 < 80)`);
+    }
+  }
+
   // Évaluation anti-rug basique (nom + symbole + image)
   let antiRugScore = 0;
   if (token.metadata) {
@@ -595,6 +660,12 @@ export async function validateToken(
     devHoldingPenalty = -50;
     totalScore += devHoldingPenalty;
     reasons.push(`🚨 Pénalité: Détention développeur trop élevée (${token.devHolding}% > 10%)`);
+  }
+
+  // FORCER LE SCORE si narratif exceptionnel (après toutes les pénalités)
+  if (shouldForceScore) {
+    totalScore = 80;
+    reasons.push(forceScoreReason);
   }
 
   // Détermination si c'est une Alerte Alpha

@@ -1,8 +1,11 @@
 # Dockerfile pour Ollama avec modèle qwen2.5:0.5b
 FROM ollama/ollama:latest
 
-# Installer curl pour le healthcheck (l'image Ollama est basée sur Debian/Ubuntu)
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# Installer curl pour le healthcheck (correction des erreurs GPG)
+# Mise à jour des clés GPG et installation de curl
+RUN apt-get update --allow-releaseinfo-change || true && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 # Exposer le port par défaut d'Ollama
 EXPOSE 11434

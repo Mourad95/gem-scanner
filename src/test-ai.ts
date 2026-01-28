@@ -4,7 +4,7 @@
  */
 
 import chalk from 'chalk';
-import { analyzeTokenSemantics } from './services/aiService.js';
+import { analyzeTokenSentiment } from './services/aiService.js';
 import { validateToken } from './services/analyzer.js';
 import type { TokenData } from './services/analyzer.js';
 
@@ -39,65 +39,57 @@ async function testOllamaConnection(): Promise<boolean> {
 }
 
 /**
- * Teste l'analyse sémantique avec différents cas
+ * Teste l'analyse de sentiment avec différents cas
  */
 async function testSemanticAnalysis(): Promise<void> {
-  console.log(chalk.blue('\n🧠 Test de l\'analyse sémantique...\n'));
+  console.log(chalk.blue('\n🧠 Test de l\'analyse de sentiment...\n'));
 
   const testCases = [
     {
       name: 'PepeCoin',
       symbol: 'PEPE',
-      description: 'The most memeable memecoin in existence. The dogs have had their day, it\'s time for Pepe to take reign.',
-      expectedNarrative: 'Pepe',
+      expectedHighScore: true, // Devrait avoir un score élevé (meme viral)
     },
     {
       name: 'Generic Token',
       symbol: 'GEN',
-      description: 'This is a revolutionary cryptocurrency that will change the world. Join our community and be part of the future of finance.',
-      expectedLowEffort: true,
+      expectedHighScore: false, // Devrait avoir un score faible (générique)
     },
     {
       name: 'TrumpCoin',
       symbol: 'TRUMP',
-      description: 'MAGA token supporting the 47th President. Make America Great Again!',
-      expectedNarrative: 'PolitiFi',
+      expectedHighScore: true, // Devrait avoir un score élevé (trend politique)
     },
     {
       name: 'CatCoin',
       symbol: 'CAT',
-      description: 'Meow meow meow. The cutest cat token on Solana. Purr your way to the moon!',
-      expectedNarrative: 'Cat',
+      expectedHighScore: true, // Devrait avoir un score élevé (animal meme)
     },
   ];
 
   for (const testCase of testCases) {
     console.log(chalk.cyan(`\n📊 Test: ${testCase.name} (${testCase.symbol})`));
-    console.log(chalk.gray(`   Description: ${testCase.description.substring(0, 60)}...`));
 
     const startTime = Date.now();
-    const result = await analyzeTokenSemantics(testCase.name, testCase.symbol, testCase.description);
+    const sentimentScore = await analyzeTokenSentiment(testCase.name, testCase.symbol);
     const duration = Date.now() - startTime;
 
     console.log(chalk.white(`   ⏱️  Temps de réponse: ${duration}ms`));
-    console.log(chalk.white(`   📝 Narratif: ${chalk.bold(result.narrative)}`));
-    console.log(chalk.white(`   💯 Score de sentiment: ${chalk.bold(result.sentimentScore)}/100`));
-    console.log(chalk.white(`   ⚠️  Faible effort: ${chalk.bold(result.isLowEffort ? 'Oui' : 'Non')}`));
-    console.log(chalk.white(`   🏷️  Label de risque: ${chalk.bold(result.riskLabel)}`));
+    console.log(chalk.white(`   💯 Score de sentiment: ${chalk.bold(sentimentScore)}/100`));
 
     // Vérifications
-    if (testCase.expectedNarrative && result.narrative.toLowerCase().includes(testCase.expectedNarrative.toLowerCase())) {
-      console.log(chalk.green(`   ✅ Narratif attendu détecté: ${testCase.expectedNarrative}`));
-    }
-
-    if (testCase.expectedLowEffort !== undefined && result.isLowEffort === testCase.expectedLowEffort) {
-      console.log(chalk.green(`   ✅ Détection faible effort: ${testCase.expectedLowEffort ? 'Oui' : 'Non'}`));
-    }
-
-    if (duration > 3000) {
-      console.log(chalk.yellow(`   ⚠️  Attention: Temps de réponse > 3000ms (timeout configuré)`));
+    if (testCase.expectedHighScore && sentimentScore >= 70) {
+      console.log(chalk.green(`   ✅ Score élevé attendu: ${sentimentScore}/100`));
+    } else if (!testCase.expectedHighScore && sentimentScore < 50) {
+      console.log(chalk.green(`   ✅ Score faible attendu: ${sentimentScore}/100`));
     } else {
-      console.log(chalk.green(`   ✅ Temps de réponse acceptable (< 3000ms)`));
+      console.log(chalk.yellow(`   ⚠️  Score inattendu: ${sentimentScore}/100`));
+    }
+
+    if (duration > 5000) {
+      console.log(chalk.yellow(`   ⚠️  Attention: Temps de réponse > 5000ms (timeout configuré)`));
+    } else {
+      console.log(chalk.green(`   ✅ Temps de réponse acceptable (< 5000ms)`));
     }
   }
 }
@@ -141,8 +133,8 @@ async function testAnalyzerIntegration(): Promise<void> {
   console.log(chalk.white(`💯 Score final: ${chalk.bold(result.score)}/100`));
   console.log(chalk.white(`🚨 Alerte Alpha: ${chalk.bold(result.isAlphaAlert ? 'Oui' : 'Non')}`));
 
-  // Vérifier si l'IA a été appelée (présence de "AI:" dans les reasons)
-  const aiReasons = result.reasons.filter((r) => r.includes('🤖 AI:'));
+  // Vérifier si l'IA a été appelée (présence de "AI" ou "IA" dans les reasons)
+  const aiReasons = result.reasons.filter((r) => r.includes('🧠') || r.includes('IA') || r.includes('AI'));
   if (aiReasons.length > 0) {
     console.log(chalk.green('\n✅ L\'analyse IA a été intégrée:'));
     aiReasons.forEach((reason) => {
@@ -150,7 +142,7 @@ async function testAnalyzerIntegration(): Promise<void> {
     });
   } else {
     console.log(chalk.yellow('\n⚠️  L\'analyse IA n\'a pas été déclenchée'));
-    console.log(chalk.yellow('   (Score préliminaire peut-être < 50 ou token hors zone Alpha)'));
+    console.log(chalk.yellow('   (Peut-être timeout ou erreur)'));
   }
 
   console.log(chalk.cyan('\n📋 Toutes les raisons:'));

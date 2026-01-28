@@ -488,6 +488,13 @@ async function main(): Promise<void> {
     console.log(chalk.bold.blue('\n╔══════════════════════════════════════╗'));
     console.log(chalk.bold.blue('║     GEM SCANNER - Solana Tokens      ║'));
     console.log(chalk.bold.blue('╚══════════════════════════════════════╝\n'));
+    
+    // Log de version pour vérifier que les modifications sont présentes
+    const BUILD_VERSION = 'v2.1.0-AI-OPTIMIZED';
+    const BUILD_TIMESTAMP = new Date().toISOString();
+    console.log(chalk.green(`✅ Version: ${BUILD_VERSION}`));
+    console.log(chalk.gray(`📅 Build: ${BUILD_TIMESTAMP}`));
+    console.log(chalk.cyan('🚀 Features: AI Sentiment Analysis + Velocity Bonus + Social Boost\n'));
 
     // Charger et valider la configuration
     const settings = loadSettings();

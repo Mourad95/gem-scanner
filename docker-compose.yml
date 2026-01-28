@@ -12,6 +12,9 @@ services:
       - ollama-models:/root/.ollama/models
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=4       # Permet de traiter 4 tokens en même temps
+      - OLLAMA_MAX_LOADED_MODELS=1  # Garde le modèle verrouillé en RAM
+      - OLLAMA_KEEP_ALIVE=-1        # Empêche le déchargement automatique
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:11434/api/tags"]
