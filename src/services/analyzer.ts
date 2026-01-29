@@ -428,10 +428,11 @@ export async function validateToken(
   // Recalcul du Market Cap si nécessaire (fallback basé sur les réserves)
   // Garantir un MC minimum d'environ $3800 pour les courbes fraîchement créées
   if (marketCap <= 0) {
-    // Utiliser vSolReserves si disponible, sinon fallback à 30 SOL (30000000000 lamports)
-    const vSolReserves = token.reserves?.vSolReserves || 30000000000;
-    // Calcul : (vSolReserves / 1e9) * solPriceUsd
-    marketCap = (vSolReserves / 1e9) * solPriceUsd;
+    // Utiliser vSolReserves si disponible, sinon fallback à 30 SOL
+    // NOTE: vSolReserves est déjà en SOL (pas en lamports) après fetchBondingCurveReserves
+    const vSolReserves = token.reserves?.vSolReserves || 30; // 30 SOL en unités réelles
+    // Calcul : vSolReserves * solPriceUsd (vSolReserves est déjà en SOL)
+    marketCap = vSolReserves * solPriceUsd;
     
     // Si toujours 0 ou trop faible, utiliser un fallback minimum (30 SOL * prix SOL)
     // Cela garantit un MC d'environ $3800 minimum (30 * 128 = 3840)
@@ -443,7 +444,15 @@ export async function validateToken(
     }
   }
 
+  // Log des réserves pour diagnostic
+  if (token.reserves) {
+    console.log(`   📊 Réserves: ${token.reserves.vSolReserves.toFixed(2)} SOL, ${token.reserves.tokenReserves.toFixed(0)} tokens`);
+  } else {
+    console.log(`   ⚠️  Réserves non disponibles (bonding curve non trouvée)`);
+  }
+  
   const progress = calculateBondingCurveProgress(token.reserves);
+  console.log(`   📈 Bonding Curve Progress: ${progress.toFixed(2)}%`);
 
   // FILTRE ÉLIMINATOIRE 1 : Market Cap minimum
   if (marketCap < MIN_MARKET_CAP) {

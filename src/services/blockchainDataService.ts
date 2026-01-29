@@ -531,39 +531,45 @@ export async function fetchBondingCurveReserves(
 
     const connection = createConnection(solana);
     
-    // 2. Retry Loop (La Tenacité) - 3 tentatives
+    // 2. Retry Loop (La Tenacité) - 5 tentatives avec timeout progressif
+    // Pour les tokens très récents, la bonding curve peut prendre quelques secondes à être propagée
     let accountInfo: { data: Buffer } | null = null;
-    const maxAttempts = 3;
+    const maxAttempts = 5;
     
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        // Utiliser 'processed' pour la première tentative (plus rapide), puis 'confirmed'
-        const commitment = attempt === 0 ? 'processed' : 'confirmed';
+        // Utiliser 'processed' pour les premières tentatives (plus rapide), puis 'confirmed' pour les dernières
+        const commitment = attempt < 2 ? 'processed' : 'confirmed';
+        // Timeout progressif : 2s, 3s, 4s, 5s, 5s
+        const timeout = Math.min(2000 + (attempt * 1000), 5000);
         
         accountInfo = await rpcRateLimiter.execute(async () => {
           return await Promise.race([
             connection.getAccountInfo(curvePublicKey, { commitment }),
             new Promise<null>((_, reject) => 
-              setTimeout(() => reject(new Error('Timeout')), 3000)
+              setTimeout(() => reject(new Error('Timeout')), timeout)
             ),
           ]) as { data: Buffer } | null;
         });
 
         // Si on a trouvé le compte, sortir de la boucle
         if (accountInfo && accountInfo.data) {
-          console.log(`   ✅ Bonding curve trouvée à la tentative ${attempt + 1}/${maxAttempts} (commitment: ${commitment})`);
+          console.log(`   ✅ Bonding curve trouvée à la tentative ${attempt + 1}/${maxAttempts} (commitment: ${commitment}, timeout: ${timeout}ms)`);
           break;
         }
 
-        // Si ce n'est pas la dernière tentative, attendre 500ms
+        // Si ce n'est pas la dernière tentative, attendre progressivement plus longtemps
+        // (les tokens récents ont besoin de plus de temps pour être propagés)
         if (attempt < maxAttempts - 1) {
-          await sleep(500);
+          const waitTime = 500 + (attempt * 200); // 500ms, 700ms, 900ms, 1100ms
+          await sleep(waitTime);
         }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : 'Erreur inconnue';
         if (attempt < maxAttempts - 1) {
           console.log(`   ⚠️  Tentative ${attempt + 1}/${maxAttempts} échouée: ${errorMsg.substring(0, 50)}`);
-          await sleep(500);
+          const waitTime = 500 + (attempt * 200);
+          await sleep(waitTime);
           continue;
         }
         // Dernière tentative échouée, on sortira avec accountInfo = null
@@ -571,10 +577,12 @@ export async function fetchBondingCurveReserves(
       }
     }
 
-    // Si le compte n'existe toujours pas après 3 tentatives, retourner null
+    // Si le compte n'existe toujours pas après toutes les tentatives, retourner null
     // (ne pas retourner les valeurs par défaut qui masquent le problème)
+    // Note: Pour les tokens très récents (< 1 minute), la bonding curve peut ne pas être encore propagée
     if (!accountInfo || !accountInfo.data) {
       console.log(`   ⚠️  Bonding curve non trouvée après ${maxAttempts} tentatives (PDA: ${curveAddress})`);
+      console.log(`   💡 Token peut être très récent (< 1 min) - la curve peut ne pas être encore propagée sur la blockchain`);
       return null;
     }
 
